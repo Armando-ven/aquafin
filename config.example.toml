@@ -1,0 +1,66 @@
+# aquafin configuration — copy to $XDG_CONFIG_HOME/aquafin/config.toml
+# (usually ~/.config/aquafin/config.toml).
+#
+# Every field is optional. Omitted fields and whole omitted sections fall back
+# to the built-in defaults shown below — deleting a section never breaks aquafin.
+
+[server]
+# Populated by the setup wizard (`aquafin` on first run, or `aquafin --setup`).
+url = ""        # e.g. "https://jellyfin.example.com" or "http://192.168.1.10:8096"
+user_id = ""    # Jellyfin user id (not the username)
+
+[ui]
+# Color theme name. Built-ins include "default" and the catppuccin variants;
+# user themes live in $XDG_CONFIG_HOME/aquafin/themes/. (Applied by the theme system.)
+theme = "default"
+# Inline image protocol: "auto" | "kitty" | "sixel" | "ascii".
+# "auto" picks the best protocol your terminal supports.
+image_protocol = "auto"
+
+[keymap]
+# Rebind any action:  <action> = "<key>[, <key> ...]"
+# Defaults are arrow-key navigation; uncomment/edit to customize.
+#
+# Recognized keys: up, down, left, right, home, end, pageup, pagedown, enter,
+#   esc, space, tab, backspace, delete, insert, f1..f12, any single character
+#   (e.g. "q", "/"), with optional "ctrl+" / "alt+" modifiers (e.g. "ctrl+d").
+#
+# Actions and their defaults:
+#   up          = "up"     # move selection up
+#   down        = "down"   # move selection down
+#   left        = "left"   # focus previous pane
+#   right       = "right"  # focus next pane
+#   top         = "home"   # jump to top
+#   bottom      = "end"    # jump to bottom
+#   back        = "backspace"  # go up a folder level (left arrow also works in a drilled list)
+#   select      = "space"  # toggle item selection
+#   play        = "enter"  # open a folder, or play the focused item (video → mpv, audio → in-app)
+#   play_pause  = "p"      # pause / resume in-app audio
+#   stop        = "s"      # stop in-app audio
+#   volume_up   = "+"      # raise audio volume
+#   volume_down = "-"      # lower audio volume
+#   help        = "f1"     # toggle the help overlay
+#   cancel      = "esc"    # close overlay / cancel
+#   quit        = "q"      # quit
+#
+# Note: "select" (multi-select) keeps the default space binding, so audio
+# play/pause is on "p" rather than space. Rebind freely, e.g. play_pause = "space".
+#
+# Example — add yazi-style hjkl alongside the arrows:
+#   up     = "up, k"
+#   down   = "down, j"
+#   left   = "left, h"
+#   right  = "right, l"
+#   top    = "home, g"
+#   bottom = "end, G"
+
+[audio]
+# Default playback volume, 0–100.
+volume = 100
+
+[log]
+# Verbosity: "error" | "warn" | "info" | "debug" | "trace".
+# The --log-level CLI flag overrides this. Default: info.
+#level = "info"
+# How many rotated daily log files to keep. Default: 5.
+#max_files = 5
