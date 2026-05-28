@@ -90,4 +90,4 @@ aquafin writes a rolling daily log to `$XDG_STATE_HOME/aquafin/` (usually `~/.lo
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU GPL v3.0 — see [LICENSE](LICENSE).
