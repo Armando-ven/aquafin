@@ -1,6 +1,5 @@
 //! Application state and the main TUI event loop.
 
-use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
@@ -41,6 +40,7 @@ pub struct Item {
     /// A container (series, season, album, artist, …) the user can drill into,
     /// as opposed to a playable leaf.
     pub is_folder: bool,
+    pub is_favorite: bool,
 }
 
 /// How an item plays back: video opens in mpv, audio plays in-app, everything
@@ -79,6 +79,11 @@ pub enum Intent {
     Stop,
     VolumeUp,
     VolumeDown,
+    SeekForward,
+    SeekBackward,
+    /// Tell the server about a favorite-state change. The app already flipped
+    /// the local item optimistically; this carries the desired remote state.
+    SetFavorite { item_id: String, favorite: bool },
 }
 
 /// Display-only snapshot of the active playback, written by the event loop each
@@ -127,8 +132,6 @@ pub struct Level {
     pub parent_id: String,
     pub items: Vec<Item>,
     pub selected: usize,
-    /// Indices marked via the select key (space). Local to this level.
-    pub marks: HashSet<usize>,
     /// Children are still being fetched.
     pub loading: bool,
 }
@@ -141,7 +144,6 @@ impl Level {
             parent_id: parent_id.into(),
             items,
             selected: 0,
-            marks: HashSet::new(),
             loading: false,
         }
     }
@@ -415,13 +417,15 @@ impl App {
             Action::Right => self.focus_next(),
             Action::Top => self.go_top(),
             Action::Bottom => self.go_bottom(),
-            Action::Select => self.toggle_mark(),
             Action::Play => self.activate(),
             Action::Back => self.go_back(),
             Action::PlayPause => self.pending.push(Intent::TogglePause),
             Action::Stop => self.pending.push(Intent::Stop),
             Action::VolumeUp => self.pending.push(Intent::VolumeUp),
             Action::VolumeDown => self.pending.push(Intent::VolumeDown),
+            Action::SeekForward => self.pending.push(Intent::SeekForward),
+            Action::SeekBackward => self.pending.push(Intent::SeekBackward),
+            Action::Favorite => self.toggle_favorite(),
             Action::Themes => self.open_theme_picker(),
             Action::Help => self.show_help = true,
             Action::Cancel => {}
@@ -468,7 +472,6 @@ impl App {
             parent_id: item.id.clone(),
             items: Vec::new(),
             selected: 0,
-            marks: HashSet::new(),
             loading: true,
         });
         self.pending.push(Intent::OpenFolder {
@@ -582,14 +585,31 @@ impl App {
         }
     }
 
-    fn toggle_mark(&mut self) {
-        if self.focus != Pane::List {
+    /// Flip the focused item's favorite state and queue a server update.
+    fn toggle_favorite(&mut self) {
+        let Some(level) = self.current_level_mut() else {
             return;
-        }
-        if let Some(level) = self.current_level_mut() {
-            let index = level.selected;
-            if index < level.items.len() && !level.marks.remove(&index) {
-                level.marks.insert(index);
+        };
+        let Some(item) = level.items.get_mut(level.selected) else {
+            return;
+        };
+        item.is_favorite = !item.is_favorite;
+        let (item_id, favorite, name) = (item.id.clone(), item.is_favorite, item.name.clone());
+        self.status_message = Some(if favorite {
+            format!("Favorited: {name}")
+        } else {
+            format!("Unfavorited: {name}")
+        });
+        self.pending.push(Intent::SetFavorite { item_id, favorite });
+    }
+
+    /// Revert an optimistic favorite toggle when the server call fails.
+    pub fn revert_favorite(&mut self, item_id: &str, favorite: bool) {
+        for level in &mut self.stack {
+            for item in &mut level.items {
+                if item.id == item_id {
+                    item.is_favorite = favorite;
+                }
             }
         }
     }
@@ -868,15 +888,28 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_mark_only_in_list() {
+    fn space_toggles_pause_intent() {
         let mut app = App::new();
-        app.handle_key(press(KeyCode::Char(' '))); // sidebar: no-op
-        assert!(app.current_level().unwrap().marks.is_empty());
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(app.take_intents(), vec![Intent::TogglePause]);
+    }
+
+    #[test]
+    fn f_toggles_favorite_optimistically_and_emits_intent() {
+        let mut app = app_with_item("Movie");
         app.handle_key(press(KeyCode::Right)); // focus list
-        app.handle_key(press(KeyCode::Char(' ')));
-        assert!(app.current_level().unwrap().marks.contains(&0));
-        app.handle_key(press(KeyCode::Char(' ')));
-        assert!(!app.current_level().unwrap().marks.contains(&0));
+        app.handle_key(press(KeyCode::Char('f')));
+        assert!(app.current_item().unwrap().is_favorite);
+        assert_eq!(
+            app.take_intents(),
+            vec![Intent::SetFavorite { item_id: "id-Thing".into(), favorite: true }]
+        );
+        app.handle_key(press(KeyCode::Char('f')));
+        assert!(!app.current_item().unwrap().is_favorite);
+        assert_eq!(
+            app.take_intents(),
+            vec![Intent::SetFavorite { item_id: "id-Thing".into(), favorite: false }]
+        );
     }
 
     fn typed_item(name: &str, kind: &str) -> Item {
@@ -991,10 +1024,12 @@ mod tests {
     fn transport_keys_queue_intents() {
         let mut app = App::new();
         for code in [
-            KeyCode::Char('p'),
+            KeyCode::Char(' '),
             KeyCode::Char('s'),
             KeyCode::Char('+'),
             KeyCode::Char('-'),
+            KeyCode::Char('>'),
+            KeyCode::Char('<'),
         ] {
             app.handle_key(press(code));
         }
@@ -1004,7 +1039,9 @@ mod tests {
                 Intent::TogglePause,
                 Intent::Stop,
                 Intent::VolumeUp,
-                Intent::VolumeDown
+                Intent::VolumeDown,
+                Intent::SeekForward,
+                Intent::SeekBackward,
             ]
         );
     }
@@ -1121,6 +1158,7 @@ mod tests {
                 kind: Some("Movie".to_string()),
                 primary_image_tag: None,
                 is_folder: false,
+                is_favorite: false,
             }],
         }]);
         let out = rendered(&app, 120, 30);

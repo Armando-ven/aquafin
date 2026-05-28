@@ -17,15 +17,20 @@ pub enum Action {
     Bottom,
     /// Go up a folder level (or to the sidebar at a library root).
     Back,
-    Select,
     /// Play the focused item: video opens in mpv, audio plays in-app.
     Play,
-    /// Pause/resume in-app audio.
+    /// Pause/resume in-app audio (or mpv video).
     PlayPause,
     /// Stop in-app audio.
     Stop,
     VolumeUp,
     VolumeDown,
+    /// Toggle favorite on the focused item.
+    Favorite,
+    /// Skip forward by the configured number of seconds.
+    SeekForward,
+    /// Skip backward by the configured number of seconds.
+    SeekBackward,
     /// Open the theme picker.
     Themes,
     Help,
@@ -50,12 +55,14 @@ const ACTIONS: &[ActionSpec] = &[
     ActionSpec { action: Action::Top, name: "top", default_keys: "home", desc: "Jump to top", group: "Navigation" },
     ActionSpec { action: Action::Bottom, name: "bottom", default_keys: "end", desc: "Jump to bottom", group: "Navigation" },
     ActionSpec { action: Action::Back, name: "back", default_keys: "backspace", desc: "Back / up a folder", group: "Navigation" },
-    ActionSpec { action: Action::Select, name: "select", default_keys: "space", desc: "Toggle item selection", group: "Selection" },
     ActionSpec { action: Action::Play, name: "play", default_keys: "enter", desc: "Play (video → mpv, audio → in-app)", group: "Playback" },
-    ActionSpec { action: Action::PlayPause, name: "play_pause", default_keys: "p", desc: "Pause / resume audio", group: "Playback" },
+    ActionSpec { action: Action::PlayPause, name: "play_pause", default_keys: "space", desc: "Pause / resume", group: "Playback" },
     ActionSpec { action: Action::Stop, name: "stop", default_keys: "s", desc: "Stop audio", group: "Playback" },
+    ActionSpec { action: Action::SeekForward, name: "seek_forward", default_keys: ">", desc: "Skip forward", group: "Playback" },
+    ActionSpec { action: Action::SeekBackward, name: "seek_backward", default_keys: "<", desc: "Skip backward", group: "Playback" },
     ActionSpec { action: Action::VolumeUp, name: "volume_up", default_keys: "+", desc: "Volume up", group: "Playback" },
     ActionSpec { action: Action::VolumeDown, name: "volume_down", default_keys: "-", desc: "Volume down", group: "Playback" },
+    ActionSpec { action: Action::Favorite, name: "favorite", default_keys: "f", desc: "Toggle favorite", group: "Library" },
     ActionSpec { action: Action::Themes, name: "themes", default_keys: "t", desc: "Pick a theme", group: "General" },
     ActionSpec { action: Action::Help, name: "help", default_keys: "f1", desc: "Toggle help", group: "General" },
     ActionSpec { action: Action::Cancel, name: "cancel", default_keys: "esc", desc: "Close overlay / cancel", group: "General" },
@@ -304,10 +311,13 @@ mod tests {
     fn playback_actions_have_defaults() {
         let km = Keymap::default();
         assert_eq!(km.action_for(ev(KeyCode::Enter, KeyModifiers::NONE)), Some(Action::Play));
-        assert_eq!(km.action_for(ev(KeyCode::Char('p'), KeyModifiers::NONE)), Some(Action::PlayPause));
+        assert_eq!(km.action_for(ev(KeyCode::Char(' '), KeyModifiers::NONE)), Some(Action::PlayPause));
         assert_eq!(km.action_for(ev(KeyCode::Char('s'), KeyModifiers::NONE)), Some(Action::Stop));
         assert_eq!(km.action_for(ev(KeyCode::Char('+'), KeyModifiers::NONE)), Some(Action::VolumeUp));
         assert_eq!(km.action_for(ev(KeyCode::Char('-'), KeyModifiers::NONE)), Some(Action::VolumeDown));
+        assert_eq!(km.action_for(ev(KeyCode::Char('>'), KeyModifiers::NONE)), Some(Action::SeekForward));
+        assert_eq!(km.action_for(ev(KeyCode::Char('<'), KeyModifiers::NONE)), Some(Action::SeekBackward));
+        assert_eq!(km.action_for(ev(KeyCode::Char('f'), KeyModifiers::NONE)), Some(Action::Favorite));
     }
 
     #[test]

@@ -24,8 +24,13 @@ use crate::api;
 pub fn run(setup: bool) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let mut terminal = app::init_terminal()?;
+    // ALSA / cpal and friends write to stderr from their C internals; inside the
+    // alternate screen those writes corrupt the TUI. Send stderr to a log file
+    // while the UI is running, then put it back.
+    crate::error::silence_stderr();
     let result = orchestrate(&mut terminal, &runtime, setup);
     app::restore_terminal(&mut terminal)?;
+    crate::error::restore_stderr();
     result
 }
 
@@ -100,7 +105,12 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
             let mut browser = browse::Browser::new(runtime.handle().clone(), client.clone());
             let mut images =
                 images::Images::new(runtime.handle().clone(), client.clone(), config.ui.image_protocol);
-            let mut player = playback::Playback::new(runtime.handle().clone(), client, audio);
+            let mut player = playback::Playback::new(
+                runtime.handle().clone(),
+                client,
+                audio,
+                config.audio.seek_seconds,
+            );
             let result = app::run_browser(
                 terminal,
                 &mut app,
@@ -152,6 +162,8 @@ fn load_libraries(
     })
 }
 
+
+
 /// Map a Jellyfin item DTO to the UI's [`app::Item`]. Shared by the startup
 /// library load and the on-demand folder browser.
 pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
@@ -159,6 +171,11 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         .image_tags
         .as_ref()
         .and_then(|tags| tags.get("Primary").cloned());
+    let is_favorite = dto
+        .user_data
+        .as_ref()
+        .and_then(|u| u.is_favorite)
+        .unwrap_or(false);
     app::Item {
         is_folder: dto.is_folder.unwrap_or(false),
         id: dto.id,
@@ -168,6 +185,7 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         run_time_ticks: dto.run_time_ticks,
         kind: dto.type_,
         primary_image_tag,
+        is_favorite,
     }
 }
 

@@ -43,6 +43,8 @@ enum Command {
     Toggle,
     Stop,
     SetVolume(u8),
+    /// Seek by `delta_secs` relative to the current position; clamped to ≥ 0.
+    SeekRelative(i32),
     Shutdown,
 }
 
@@ -137,6 +139,18 @@ impl AudioEngine {
 
     pub fn stop(&self) {
         let _ = self.tx.send(Command::Stop);
+    }
+
+    /// Seek by `delta_secs` from the current position. Negative seeks back; the
+    /// resulting position is clamped at the start of the track.
+    pub fn seek_relative(&self, delta_secs: i32) {
+        let _ = self.tx.send(Command::SeekRelative(delta_secs));
+    }
+
+    /// True if a track is loaded (playing or paused) — UI uses this to decide
+    /// whether seek/pause feedback applies.
+    pub fn has_track(&self) -> bool {
+        self.shared.has_track.load(Ordering::Relaxed)
     }
 
     /// Adjust volume by `delta` percentage points, clamped to 0..=100.
@@ -247,11 +261,18 @@ fn audio_thread(rx: mpsc::Receiver<Command>, shared: Arc<Shared>, ready: Sender<
     shared.available.store(true, Ordering::Relaxed);
     let _ = ready.send(());
 
+    // We hang on to the current track's encoded bytes so seeks (especially
+    // backward) can rebuild the decoder from zero — rodio's try_seek on streamed
+    // decoders is unreliable backward across codecs, so we re-decode + skip
+    // forward to the target, which works for every format we accept.
+    let mut current_bytes: Option<Arc<Vec<u8>>> = None;
+
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(Command::Play { bytes, meta }) => {
                 player.clear();
-                match Decoder::new(Cursor::new(bytes)) {
+                let bytes = Arc::new(bytes);
+                match Decoder::new(Cursor::new(bytes.as_ref().clone())) {
                     Ok(decoder) => {
                         let duration = decoder.total_duration();
                         shared
@@ -262,6 +283,7 @@ fn audio_thread(rx: mpsc::Receiver<Command>, shared: Arc<Shared>, ready: Sender<
                         shared.has_track.store(true, Ordering::Relaxed);
                         shared.paused.store(false, Ordering::Relaxed);
                         shared.finished.store(false, Ordering::Relaxed);
+                        current_bytes = Some(bytes);
                         player.append(decoder);
                         player.play();
                     }
@@ -271,6 +293,7 @@ fn audio_thread(rx: mpsc::Receiver<Command>, shared: Arc<Shared>, ready: Sender<
                             Some(format!("could not decode this track: {e}"));
                         shared.has_track.store(false, Ordering::Relaxed);
                         *shared.track.lock().unwrap() = None;
+                        current_bytes = None;
                     }
                 }
             }
@@ -288,10 +311,43 @@ fn audio_thread(rx: mpsc::Receiver<Command>, shared: Arc<Shared>, ready: Sender<
             Ok(Command::Stop) => {
                 player.clear();
                 clear_track(&shared);
+                current_bytes = None;
             }
             Ok(Command::SetVolume(v)) => {
                 player.set_volume(volume_to_gain(v));
                 shared.volume.store(v, Ordering::Relaxed);
+            }
+            Ok(Command::SeekRelative(delta_secs)) => {
+                if shared.has_track.load(Ordering::Relaxed) {
+                    let current_ms = shared.position_ms.load(Ordering::Relaxed) as i64;
+                    let target_ms = (current_ms + (delta_secs as i64) * 1000).max(0) as u64;
+                    let target = Duration::from_millis(target_ms);
+                    let was_paused = shared.paused.load(Ordering::Relaxed);
+                    let rebuilt = if delta_secs < 0 {
+                        // Backward seeks: rebuild from the start. try_seek on a
+                        // streamed Decoder is unreliable across codecs going
+                        // backward; re-decoding + forward-seeking always works.
+                        rebuild_and_seek(&player, current_bytes.as_ref(), target)
+                    } else {
+                        // Forward: try in-place seek first; if that fails, fall
+                        // back to rebuild (same reasoning).
+                        match player.try_seek(target) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "in-place seek failed; rebuilding");
+                                rebuild_and_seek(&player, current_bytes.as_ref(), target)
+                            }
+                        }
+                    };
+                    if rebuilt {
+                        shared.position_ms.store(target_ms, Ordering::Relaxed);
+                        if was_paused {
+                            player.pause();
+                        }
+                    } else {
+                        tracing::warn!("audio seek failed");
+                    }
+                }
             }
             Ok(Command::Shutdown) => {
                 player.stop();
@@ -312,6 +368,38 @@ fn audio_thread(rx: mpsc::Receiver<Command>, shared: Arc<Shared>, ready: Sender<
             }
         }
     }
+}
+
+/// Rebuild the decoder from the cached bytes and seek to `target` by skipping
+/// from the start. Returns `false` if there are no cached bytes, decoding fails,
+/// or the forward seek itself fails — leaving the player cleared.
+fn rebuild_and_seek(
+    player: &rodio::Player,
+    bytes: Option<&Arc<Vec<u8>>>,
+    target: Duration,
+) -> bool {
+    let Some(bytes) = bytes else {
+        return false;
+    };
+    let decoder = match Decoder::new(Cursor::new(bytes.as_ref().clone())) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "audio re-decode for seek failed");
+            return false;
+        }
+    };
+    player.clear();
+    player.append(decoder);
+    // After clear(), the player is paused; play and then seek forward to target.
+    player.play();
+    if target.is_zero() {
+        return true;
+    }
+    if let Err(e) = player.try_seek(target) {
+        tracing::warn!(error = %e, "forward seek on rebuilt decoder failed");
+        return false;
+    }
+    true
 }
 
 fn clear_track(shared: &Shared) {

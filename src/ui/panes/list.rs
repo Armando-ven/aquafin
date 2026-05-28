@@ -52,9 +52,8 @@ pub fn render(
     let list_items: Vec<ListItem> = level
         .items
         .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let marker = if level.marks.contains(&index) { "● " } else { "  " };
+        .map(|item| {
+            let marker = if item.is_favorite { "♥ " } else { "  " };
             let mut spans = vec![Span::raw(format!("{marker}{}", item.name))];
             if item.is_folder {
                 // A trailing arrow signals an item you can drill into.

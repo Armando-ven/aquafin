@@ -44,6 +44,17 @@ impl JellyfinClient {
         .await
     }
 
+    /// `POST` or `DELETE /Users/{userId}/FavoriteItems/{itemId}` — toggle favorite.
+    pub async fn set_favorite(&self, item_id: &str, favorite: bool) -> Result<()> {
+        let path = format!("/Users/{}/FavoriteItems/{}", self.user_id(), item_id);
+        let method = if favorite {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::DELETE
+        };
+        self.send_no_content(self.request(method, &path)).await
+    }
+
     /// `GET /Items/{itemId}/Images/Primary` — primary image bytes.
     pub async fn primary_image(
         &self,

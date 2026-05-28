@@ -59,12 +59,18 @@ pub enum ImageProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
+    /// Default playback volume, 0–100, applied at startup.
     pub volume: u8,
+    /// How many seconds the seek_forward / seek_backward actions skip.
+    pub seek_seconds: u32,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { volume: 100 }
+        Self {
+            volume: 100,
+            seek_seconds: 5,
+        }
     }
 }
 

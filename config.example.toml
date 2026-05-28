@@ -29,26 +29,25 @@ image_protocol = "auto"
 #   (e.g. "q", "/"), with optional "ctrl+" / "alt+" modifiers (e.g. "ctrl+d").
 #
 # Actions and their defaults:
-#   up          = "up"     # move selection up
-#   down        = "down"   # move selection down
-#   left        = "left"   # focus previous pane
-#   right       = "right"  # focus next pane
-#   top         = "home"   # jump to top
-#   bottom      = "end"    # jump to bottom
-#   back        = "backspace"  # go up a folder level (left arrow also works in a drilled list)
-#   themes      = "t"      # open the theme picker
-#   select      = "space"  # toggle item selection
-#   play        = "enter"  # open a folder, or play the focused item (video → mpv, audio → in-app)
-#   play_pause  = "p"      # pause / resume in-app audio
-#   stop        = "s"      # stop in-app audio
-#   volume_up   = "+"      # raise audio volume
-#   volume_down = "-"      # lower audio volume
-#   help        = "f1"     # toggle the help overlay
-#   cancel      = "esc"    # close overlay / cancel
-#   quit        = "q"      # quit
-#
-# Note: "select" (multi-select) keeps the default space binding, so audio
-# play/pause is on "p" rather than space. Rebind freely, e.g. play_pause = "space".
+#   up            = "up"        # move selection up
+#   down          = "down"      # move selection down
+#   left          = "left"      # focus previous pane
+#   right         = "right"     # focus next pane
+#   top           = "home"      # jump to top
+#   bottom        = "end"       # jump to bottom
+#   back          = "backspace" # go up a folder level (left arrow also works in a drilled list)
+#   themes        = "t"         # open the theme picker
+#   play          = "enter"     # open a folder, or play the focused item (video → mpv, audio → in-app)
+#   play_pause    = "space"     # pause / resume the active playback
+#   stop          = "s"         # stop in-app audio
+#   seek_forward  = ">"         # skip forward by audio.seek_seconds
+#   seek_backward = "<"         # skip backward by audio.seek_seconds
+#   volume_up     = "+"         # raise audio volume
+#   volume_down   = "-"         # lower audio volume
+#   favorite      = "f"         # toggle favorite on the focused item
+#   help          = "f1"        # toggle the help overlay
+#   cancel        = "esc"       # close overlay / cancel
+#   quit          = "q"         # quit
 #
 # Example — add yazi-style hjkl alongside the arrows:
 #   up     = "up, k"
@@ -59,8 +58,10 @@ image_protocol = "auto"
 #   bottom = "end, G"
 
 [audio]
-# Default playback volume, 0–100.
+# Default playback volume, 0–100, applied at startup.
 volume = 100
+# How many seconds the seek_forward / seek_backward keybinds skip.
+seek_seconds = 5
 
 [log]
 # Verbosity: "error" | "warn" | "info" | "debug" | "trace".

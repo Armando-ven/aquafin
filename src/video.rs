@@ -71,6 +71,29 @@ pub fn query_time_pos(socket_path: &Path) -> std::io::Result<Option<f64>> {
     query_f64_property(socket_path, "time-pos")
 }
 
+/// Send a relative seek (positive = forward, negative = backward, in seconds)
+/// to mpv. Best-effort: the reply isn't consumed.
+pub fn seek_relative(socket_path: &Path, delta_secs: i32) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    let cmd = serde_json::json!({
+        "command": ["seek", delta_secs, "relative"],
+    });
+    stream.write_all(format!("{cmd}\n").as_bytes())?;
+    stream.flush()
+}
+
+/// Toggle mpv's pause property over IPC. Best-effort.
+pub fn toggle_pause(socket_path: &Path) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    let cmd = serde_json::json!({
+        "command": ["cycle", "pause"],
+    });
+    stream.write_all(format!("{cmd}\n").as_bytes())?;
+    stream.flush()
+}
+
 impl Drop for VideoSession {
     /// If aquafin exits while mpv is still up, leave mpv running (it's the user's
     /// window) but clean up the socket file we created.

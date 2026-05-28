@@ -31,6 +31,13 @@ const VOLUME_STEP: i16 = 5;
 enum FetchResult {
     Ready { bytes: Vec<u8>, meta: TrackMeta },
     Failed(String),
+    /// The server rejected a favorite toggle; the optimistic flip in the UI
+    /// must be reverted to `previous`.
+    FavoriteFailed {
+        item_id: String,
+        previous: bool,
+        error: String,
+    },
 }
 
 /// A running mpv session plus the bookkeeping the controller keeps alongside it.
@@ -56,10 +63,11 @@ pub struct Playback {
     audio_session: Option<AudioSession>,
     fetch_tx: Sender<FetchResult>,
     fetch_rx: Receiver<FetchResult>,
+    seek_seconds: u32,
 }
 
 impl Playback {
-    pub fn new(rt: Handle, client: JellyfinClient, audio: AudioEngine) -> Self {
+    pub fn new(rt: Handle, client: JellyfinClient, audio: AudioEngine, seek_seconds: u32) -> Self {
         let (fetch_tx, fetch_rx) = mpsc::channel();
         Self {
             rt,
@@ -69,6 +77,7 @@ impl Playback {
             audio_session: None,
             fetch_tx,
             fetch_rx,
+            seek_seconds,
         }
     }
 
@@ -80,14 +89,62 @@ impl Playback {
                 MediaKind::Audio => self.start_audio(item, app),
                 MediaKind::Other => {}
             },
-            Intent::TogglePause => self.audio.toggle(),
+            Intent::TogglePause => self.toggle_pause(),
             Intent::Stop => self.stop_audio(),
             Intent::VolumeUp => self.audio.nudge_volume(VOLUME_STEP),
             Intent::VolumeDown => self.audio.nudge_volume(-VOLUME_STEP),
+            Intent::SeekForward => self.seek(self.seek_seconds as i32),
+            Intent::SeekBackward => self.seek(-(self.seek_seconds as i32)),
+            Intent::SetFavorite { item_id, favorite } => self.set_favorite(item_id, favorite, app),
             // Folder drilling is handled by the browser, theme switches by the
             // run loop, not playback.
             Intent::OpenFolder { .. } | Intent::SetTheme(_) => {}
         }
+    }
+
+    /// Pause/resume whichever is active: prefer mpv when a video session is up,
+    /// otherwise the in-app audio.
+    fn toggle_pause(&mut self) {
+        if let Some(video) = &self.video {
+            if let Err(e) = video::toggle_pause(video.session.socket_path()) {
+                tracing::warn!(error = %e, "mpv pause toggle failed");
+            }
+        } else {
+            self.audio.toggle();
+        }
+    }
+
+    /// Seek `delta_secs` (positive forward, negative backward) on whatever is
+    /// playing. No-op if nothing is.
+    fn seek(&mut self, delta_secs: i32) {
+        if let Some(video) = &self.video {
+            if let Err(e) = video::seek_relative(video.session.socket_path(), delta_secs) {
+                tracing::warn!(error = %e, "mpv seek failed");
+            }
+        } else if self.audio.has_track() {
+            self.audio.seek_relative(delta_secs);
+        }
+    }
+
+    /// POST/DELETE the favorite to Jellyfin; on failure, revert the app's
+    /// optimistic local flip and show an error.
+    fn set_favorite(&self, item_id: String, favorite: bool, app: &mut App) {
+        let client = self.client.clone();
+        let tx = self.fetch_tx.clone();
+        let id = item_id.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = client.set_favorite(&id, favorite).await {
+                tracing::warn!(error = %e, item_id = %id, favorite, "favorite request failed");
+                let _ = tx.send(FetchResult::FavoriteFailed {
+                    item_id: id,
+                    previous: !favorite,
+                    error: e.to_string(),
+                });
+            }
+        });
+        // Touch `app` for symmetry with the other dispatch arms (no UI change
+        // needed: the toggle was applied optimistically in handle_key).
+        let _ = app;
     }
 
     /// Per-frame housekeeping: collect finished downloads, notice mpv/audio
@@ -97,6 +154,10 @@ impl Playback {
             match result {
                 FetchResult::Ready { bytes, meta } => self.begin_audio(bytes, meta),
                 FetchResult::Failed(message) => app.show_error(message),
+                FetchResult::FavoriteFailed { item_id, previous, error } => {
+                    app.revert_favorite(&item_id, previous);
+                    app.show_error(format!("Couldn't update favorite: {error}"));
+                }
             }
         }
 
@@ -409,7 +470,7 @@ mod tests {
             .unwrap();
         let client = JellyfinClient::new("http://localhost", "tok", "u1", "dev").unwrap();
         let audio = AudioEngine::new(50);
-        let mut playback = Playback::new(runtime.handle().clone(), client, audio);
+        let mut playback = Playback::new(runtime.handle().clone(), client, audio, 5);
 
         let mut app = App::new();
         playback.dispatch(Intent::VolumeUp, &mut app);
