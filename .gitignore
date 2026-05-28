@@ -21,3 +21,6 @@ Thumbs.db
 
 # Internal build plan — not for publication
 /aquafin-build-plan.md
+
+# Claude Code project instructions — local only
+/CLAUDE.md
