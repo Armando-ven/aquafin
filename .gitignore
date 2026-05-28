@@ -12,3 +12,12 @@
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Local secrets / runtime state — never commit
+/config.toml
+/credentials.toml
+.env
+.env.*
+
+# Internal build plan — not for publication
+/aquafin-build-plan.md
