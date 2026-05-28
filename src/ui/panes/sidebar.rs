@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{Block, List, ListItem, ListState};
 use ratatui::Frame;
 
-use super::{border_style, highlight_style};
+use crate::theme::Theme;
 use crate::ui::app::Library;
 
 pub fn render(
@@ -13,6 +13,7 @@ pub fn render(
     libraries: &[Library],
     focused: bool,
     selected: usize,
+    theme: &Theme,
 ) {
     let items: Vec<ListItem> = libraries
         .iter()
@@ -22,9 +23,10 @@ pub fn render(
         .block(
             Block::bordered()
                 .title(" Libraries ")
-                .border_style(border_style(focused)),
+                .border_style(theme.border(focused)),
         )
-        .highlight_style(highlight_style(focused))
+        .style(theme.list_item())
+        .highlight_style(theme.selected_item(focused))
         .highlight_symbol("› ");
 
     let mut state = ListState::default();

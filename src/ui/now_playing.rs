@@ -6,12 +6,12 @@
 use std::time::Duration;
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, LineGauge, Paragraph};
 use ratatui::Frame;
 
 use super::images::Images;
+use crate::theme::Theme;
 use crate::ui::app::{MediaKind, NowPlaying};
 
 pub fn render(
@@ -19,18 +19,19 @@ pub fn render(
     area: Rect,
     now_playing: Option<&NowPlaying>,
     images: Option<&mut Images>,
+    theme: &Theme,
 ) {
     // A top border separates the bar from the panes above.
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::new().fg(Color::DarkGray));
+        .border_style(theme.unfocused_border());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let Some(np) = now_playing else {
         frame.render_widget(
             Paragraph::new("Nothing playing")
-                .style(Style::new().fg(Color::DarkGray))
+                .style(theme.muted())
                 .alignment(Alignment::Center),
             inner,
         );
@@ -57,10 +58,10 @@ pub fn render(
         inner
     };
 
-    render_info(frame, info, np);
+    render_info(frame, info, np, theme);
 }
 
-fn render_info(frame: &mut Frame, area: Rect, np: &NowPlaying) {
+fn render_info(frame: &mut Frame, area: Rect, np: &NowPlaying, theme: &Theme) {
     let [title_row, subtitle_row, gauge_row, meta_row] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -77,18 +78,15 @@ fn render_info(frame: &mut Frame, area: Rect, np: &NowPlaying) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("{marker} "), Style::new().fg(Color::Cyan)),
-            Span::styled(
-                np.title.clone(),
-                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{marker} "), theme.focused_border()),
+            Span::styled(np.title.clone(), theme.now_playing_title()),
         ])),
         title_row,
     );
 
     if let Some(subtitle) = &np.subtitle {
         frame.render_widget(
-            Paragraph::new(Span::styled(subtitle.clone(), Style::new().fg(Color::Gray))),
+            Paragraph::new(Span::styled(subtitle.clone(), theme.now_playing_subtitle())),
             subtitle_row,
         );
     }
@@ -103,8 +101,8 @@ fn render_info(frame: &mut Frame, area: Rect, np: &NowPlaying) {
     frame.render_widget(
         LineGauge::default()
             .ratio(ratio)
-            .filled_style(Style::new().fg(Color::Cyan))
-            .unfilled_style(Style::new().fg(Color::DarkGray)),
+            .filled_style(theme.progress_bar())
+            .unfilled_style(theme.progress_track()),
         gauge_row,
     );
 
@@ -128,12 +126,12 @@ fn render_info(frame: &mut Frame, area: Rect, np: &NowPlaying) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right.chars().count() as u16)])
             .areas(meta_row);
     frame.render_widget(
-        Paragraph::new(times).style(Style::new().fg(Color::Gray)),
+        Paragraph::new(times).style(theme.now_playing_meta()),
         time_area,
     );
     frame.render_widget(
         Paragraph::new(right)
-            .style(Style::new().fg(Color::DarkGray))
+            .style(theme.now_playing_meta())
             .alignment(Alignment::Right),
         right_area,
     );

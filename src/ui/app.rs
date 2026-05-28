@@ -12,12 +12,12 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 
 use super::keymap::{Action, Keymap};
-use super::{cheatsheet, error_modal, layout, panes};
+use super::{cheatsheet, error_modal, layout, panes, theme_picker};
+use crate::theme::Theme;
 
 pub(crate) type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -73,6 +73,8 @@ pub enum Intent {
     /// Load and drill into a folder's children (the loading level is already
     /// pushed; the loader fills it by `id`).
     OpenFolder { id: String, title: String },
+    /// Apply a theme by name (loaded by the event loop).
+    SetTheme(String),
     TogglePause,
     Stop,
     VolumeUp,
@@ -171,6 +173,12 @@ pub struct App {
     pub should_quit: bool,
     /// Display snapshot of current playback; set by the event loop, read by render.
     pub now_playing: Option<NowPlaying>,
+    /// The active color theme.
+    pub theme: Theme,
+    /// Selectable theme names, for the runtime picker.
+    available_themes: Vec<String>,
+    /// When the theme picker is open, the highlighted index into `available_themes`.
+    theme_picker: Option<usize>,
     /// Transient one-liner in the status bar (e.g. "Not playable"); cleared on the
     /// next key press.
     status_message: Option<String>,
@@ -235,6 +243,9 @@ impl App {
             show_help: false,
             should_quit: false,
             now_playing: None,
+            theme: Theme::default(),
+            available_themes: Vec::new(),
+            theme_picker: None,
             status_message: None,
             pending: Vec::new(),
             error: None,
@@ -247,6 +258,28 @@ impl App {
     pub fn with_keymap(mut self, keymap: Keymap) -> Self {
         self.keymap = keymap;
         self
+    }
+
+    /// Set the active theme (startup, from config, or a runtime switch).
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Provide the selectable theme names (built-ins + user themes).
+    pub fn with_available_themes(mut self, names: Vec<String>) -> Self {
+        self.available_themes = names;
+        self
+    }
+
+    /// Picker overlay state for the renderer: the names and the highlighted index.
+    pub fn theme_picker(&self) -> Option<(&[String], usize)> {
+        self.theme_picker
+            .map(|selected| (self.available_themes.as_slice(), selected))
     }
 
     /// Surface an error to the user via the modal overlay.
@@ -341,6 +374,26 @@ impl App {
             return;
         }
 
+        // The theme picker captures input while open.
+        if let Some(selected) = self.theme_picker {
+            match key.code {
+                KeyCode::Up => self.theme_picker = Some(selected.saturating_sub(1)),
+                KeyCode::Down => {
+                    let max = self.available_themes.len().saturating_sub(1);
+                    self.theme_picker = Some((selected + 1).min(max));
+                }
+                KeyCode::Enter => {
+                    if let Some(name) = self.available_themes.get(selected) {
+                        self.pending.push(Intent::SetTheme(name.clone()));
+                    }
+                    self.theme_picker = None;
+                }
+                KeyCode::Esc => self.theme_picker = None,
+                _ => {}
+            }
+            return;
+        }
+
         // Any key dismisses the help overlay.
         if self.show_help {
             self.show_help = false;
@@ -369,9 +422,23 @@ impl App {
             Action::Stop => self.pending.push(Intent::Stop),
             Action::VolumeUp => self.pending.push(Intent::VolumeUp),
             Action::VolumeDown => self.pending.push(Intent::VolumeDown),
+            Action::Themes => self.open_theme_picker(),
             Action::Help => self.show_help = true,
             Action::Cancel => {}
         }
+    }
+
+    /// Open the theme picker on the currently-active theme.
+    fn open_theme_picker(&mut self) {
+        if self.available_themes.is_empty() {
+            return;
+        }
+        let current = self
+            .available_themes
+            .iter()
+            .position(|name| name == self.theme.name())
+            .unwrap_or(0);
+        self.theme_picker = Some(current);
     }
 
     /// Enter on the focused item: drill into a folder, play a leaf, or note that
@@ -569,7 +636,8 @@ pub(crate) fn run_browser(
                 app.handle_key(key);
             }
         }
-        // Folder drilling goes to the browser; everything else is playback.
+        // Folder drilling goes to the browser; theme switches the loop handles
+        // directly; everything else is playback.
         for intent in app.take_intents() {
             match intent {
                 Intent::OpenFolder { id, .. } => {
@@ -577,6 +645,13 @@ pub(crate) fn run_browser(
                         br.open(id);
                     }
                 }
+                Intent::SetTheme(name) => match crate::theme::load(&name) {
+                    Ok(theme) => app.set_theme(theme),
+                    Err(e) => {
+                        tracing::warn!(theme = %name, error = %e, "couldn't load theme");
+                        app.show_error(format!("Couldn't load theme \"{name}\": {e}"));
+                    }
+                },
                 other => {
                     if let Some(pb) = playback.as_deref_mut() {
                         pb.dispatch(other, app);
@@ -611,6 +686,7 @@ pub(crate) fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::images::Images>) {
     let area = frame.area();
     let regions = layout::compute(area);
+    let theme = &app.theme;
 
     panes::sidebar::render(
         frame,
@@ -618,6 +694,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         &app.libraries,
         app.focus == Pane::Sidebar,
         app.sidebar_selected,
+        theme,
     );
 
     panes::list::render(
@@ -626,6 +703,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         app.current_level(),
         &app.breadcrumb(),
         app.focus == Pane::List,
+        theme,
     );
 
     panes::detail::render(
@@ -634,6 +712,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         app.current_item(),
         app.focus == Pane::Detail,
         images.as_deref_mut(),
+        theme,
     );
 
     super::now_playing::render(
@@ -641,6 +720,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         regions.now_playing,
         app.now_playing.as_ref(),
         images,
+        theme,
     );
 
     render_status(frame, regions.status, app);
@@ -649,9 +729,18 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         let log_location = crate::paths::state_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        error_modal::render(frame, area, message, &log_location, app.error_copied);
+        error_modal::render(
+            frame,
+            area,
+            message,
+            &log_location,
+            app.error_copied,
+            theme,
+        );
+    } else if let Some((names, selected)) = app.theme_picker() {
+        theme_picker::render(frame, area, names, selected, theme.name(), theme);
     } else if app.show_help {
-        cheatsheet::render(frame, area, &app.keymap);
+        cheatsheet::render(frame, area, &app.keymap, theme);
     }
 }
 
@@ -669,17 +758,18 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {focus_name}  ·  {}  ·  {item} ", app.breadcrumb())
         }
     };
-    let hint = " Enter open/play · Bksp back · F1 help · q quit ";
+    let hint = " Enter open/play · Bksp back · t themes · F1 help · q quit ";
 
-    let bar = Style::new().bg(Color::Indexed(236)).fg(Color::Gray);
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Min(0),
         Constraint::Length(hint.chars().count() as u16),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(left).style(bar), left_area);
+    frame.render_widget(Paragraph::new(left).style(app.theme.status_bar()), left_area);
     frame.render_widget(
-        Paragraph::new(hint).style(bar).alignment(Alignment::Right),
+        Paragraph::new(hint)
+            .style(app.theme.hint())
+            .alignment(Alignment::Right),
         right_area,
     );
 }
@@ -939,6 +1029,66 @@ mod tests {
         assert!(out.contains("0:30"));
     }
 
+
+    #[test]
+    fn t_opens_theme_picker_and_enter_emits_set_theme() {
+        let mut app = App::new().with_available_themes(vec![
+            "default".to_string(),
+            "catppuccin-mocha".to_string(),
+        ]);
+        app.handle_key(press(KeyCode::Char('t')));
+        // Picker opens on the active theme ("default" → index 0).
+        let (names, selected) = app.theme_picker().expect("picker open");
+        assert_eq!(names, ["default", "catppuccin-mocha"]);
+        assert_eq!(selected, 0);
+
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.theme_picker().is_none(), "Enter should close the picker");
+        assert_eq!(
+            app.take_intents().as_slice(),
+            [Intent::SetTheme("catppuccin-mocha".into())]
+        );
+    }
+
+    #[test]
+    fn esc_closes_theme_picker_without_intent() {
+        let mut app = App::new().with_available_themes(vec!["default".into()]);
+        app.handle_key(press(KeyCode::Char('t')));
+        assert!(app.theme_picker().is_some());
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.theme_picker().is_none());
+        assert!(app.take_intents().is_empty());
+    }
+
+    #[test]
+    fn theme_change_alters_rendered_border_color() {
+        // Sanity check that themes actually feed into the renderer: the same UI
+        // under two different themes should produce different border colors.
+        fn border_fg(app: &App) -> ratatui::style::Color {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| render(frame, app, None)).unwrap();
+            // x=0, y=0 is the top-left of the sidebar border (which the sidebar
+            // is focused on, so it picks up `focused_border`).
+            terminal.backend().buffer().cell((0, 0)).unwrap().fg
+        }
+        let mut app = App::new();
+        let default_fg = border_fg(&app);
+        app.set_theme(crate::theme::load("catppuccin-latte").unwrap());
+        let latte_fg = border_fg(&app);
+        assert_ne!(
+            default_fg, latte_fg,
+            "switching themes should change the rendered border color"
+        );
+    }
+
+    #[test]
+    fn set_theme_changes_active_theme_name() {
+        let mut app = App::new();
+        assert_eq!(app.theme.name(), "default");
+        app.set_theme(crate::theme::load("catppuccin-latte").unwrap());
+        assert_eq!(app.theme.name(), "catppuccin-latte");
+    }
 
     #[test]
     fn now_playing_bar_shows_idle_placeholder_when_nothing_plays() {

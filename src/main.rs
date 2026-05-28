@@ -20,6 +20,20 @@ fn main() -> Result<()> {
     let _log_guard = aquafin::error::init_logging(level, max_files)?;
     aquafin::error::install_panic_hook();
 
+    // --import-theme is a one-shot: copy the file into the themes dir and exit.
+    if let Some(src) = cli.import_theme {
+        let dest = aquafin::theme::import(&src)?;
+        let stem = dest
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        println!(
+            "Imported theme to {}. Select with `ui.theme = \"{stem}\"` in config.toml, or press `t` in aquafin.",
+            dest.display()
+        );
+        return Ok(());
+    }
+
     tracing::info!(setup = cli.setup, "starting aquafin");
     aquafin::ui::run(cli.setup)
 }

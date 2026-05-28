@@ -26,6 +26,8 @@ pub enum Action {
     Stop,
     VolumeUp,
     VolumeDown,
+    /// Open the theme picker.
+    Themes,
     Help,
     Cancel,
 }
@@ -54,6 +56,7 @@ const ACTIONS: &[ActionSpec] = &[
     ActionSpec { action: Action::Stop, name: "stop", default_keys: "s", desc: "Stop audio", group: "Playback" },
     ActionSpec { action: Action::VolumeUp, name: "volume_up", default_keys: "+", desc: "Volume up", group: "Playback" },
     ActionSpec { action: Action::VolumeDown, name: "volume_down", default_keys: "-", desc: "Volume down", group: "Playback" },
+    ActionSpec { action: Action::Themes, name: "themes", default_keys: "t", desc: "Pick a theme", group: "General" },
     ActionSpec { action: Action::Help, name: "help", default_keys: "f1", desc: "Toggle help", group: "General" },
     ActionSpec { action: Action::Cancel, name: "cancel", default_keys: "esc", desc: "Close overlay / cancel", group: "General" },
     ActionSpec { action: Action::Quit, name: "quit", default_keys: "q", desc: "Quit", group: "General" },

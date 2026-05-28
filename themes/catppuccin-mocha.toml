@@ -1,0 +1,15 @@
+# Catppuccin Mocha (dark). https://github.com/catppuccin/catppuccin
+name = "catppuccin-mocha"
+
+[palette]
+base = "#1e1e2e"
+surface = "#313244"
+overlay = "#45475a"
+text = "#cdd6f4"
+subtext = "#a6adc8"
+accent = "#89b4fa"
+success = "#a6e3a1"
+warn = "#f9e2af"
+error = "#f38ba8"
+border = "#585b70"
+selection = "#45475a"

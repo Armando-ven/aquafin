@@ -10,8 +10,11 @@ url = ""        # e.g. "https://jellyfin.example.com" or "http://192.168.1.10:80
 user_id = ""    # Jellyfin user id (not the username)
 
 [ui]
-# Color theme name. Built-ins include "default" and the catppuccin variants;
-# user themes live in $XDG_CONFIG_HOME/aquafin/themes/. (Applied by the theme system.)
+# Color theme name. Built-ins: "default", "catppuccin-mocha", "catppuccin-macchiato",
+# "catppuccin-frappe", "catppuccin-latte". Drop your own .toml files into
+# $XDG_CONFIG_HOME/aquafin/themes/ (or import with `aquafin --import-theme <path>`).
+# Press `t` in aquafin to switch at runtime; the change is session-only — edit
+# this field for a permanent default. See themes/example.toml for the schema.
 theme = "default"
 # Inline image protocol: "auto" | "kitty" | "sixel" | "ascii".
 # "auto" picks the best protocol your terminal supports.
@@ -33,6 +36,7 @@ image_protocol = "auto"
 #   top         = "home"   # jump to top
 #   bottom      = "end"    # jump to bottom
 #   back        = "backspace"  # go up a folder level (left arrow also works in a drilled list)
+#   themes      = "t"      # open the theme picker
 #   select      = "space"  # toggle item selection
 #   play        = "enter"  # open a folder, or play the focused item (video → mpv, audio → in-app)
 #   play_pause  = "p"      # pause / resume in-app audio

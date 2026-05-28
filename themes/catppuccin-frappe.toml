@@ -1,0 +1,15 @@
+# Catppuccin Frappé (dark). https://github.com/catppuccin/catppuccin
+name = "catppuccin-frappe"
+
+[palette]
+base = "#303446"
+surface = "#414559"
+overlay = "#51576d"
+text = "#c6d0f5"
+subtext = "#a5adce"
+accent = "#8caaee"
+success = "#a6d189"
+warn = "#e5c890"
+error = "#e78284"
+border = "#626880"
+selection = "#51576d"

@@ -84,8 +84,9 @@ impl Playback {
             Intent::Stop => self.stop_audio(),
             Intent::VolumeUp => self.audio.nudge_volume(VOLUME_STEP),
             Intent::VolumeDown => self.audio.nudge_volume(-VOLUME_STEP),
-            // Folder drilling is handled by the browser, not playback.
-            Intent::OpenFolder { .. } => {}
+            // Folder drilling is handled by the browser, theme switches by the
+            // run loop, not playback.
+            Intent::OpenFolder { .. } | Intent::SetTheme(_) => {}
         }
     }
 

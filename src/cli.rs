@@ -13,6 +13,10 @@ pub struct Cli {
     /// Logging verbosity (overrides the `log.level` config field).
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
+
+    /// Import a theme TOML into `$XDG_CONFIG_HOME/aquafin/themes/`, then exit.
+    #[arg(long, value_name = "PATH")]
+    pub import_theme: Option<std::path::PathBuf>,
 }
 
 /// Logging verbosity, mirroring `tracing`'s levels.

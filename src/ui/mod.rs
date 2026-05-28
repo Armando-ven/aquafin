@@ -11,6 +11,7 @@ pub mod layout;
 pub mod now_playing;
 pub mod panes;
 pub mod playback;
+pub mod theme_picker;
 pub mod wizard;
 
 use anyhow::Result;
@@ -71,7 +72,19 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
         None => Vec::new(),
     };
 
-    let mut app = app::App::with_libraries(libraries).with_keymap(keys);
+    // Apply the configured theme (fall back to default if it can't load).
+    let theme = match crate::theme::load(&config.ui.theme) {
+        Ok(theme) => theme,
+        Err(e) => {
+            tracing::warn!(theme = %config.ui.theme, error = %e, "couldn't load theme; using default");
+            crate::theme::Theme::default()
+        }
+    };
+
+    let mut app = app::App::with_libraries(libraries)
+        .with_keymap(keys)
+        .with_theme(theme)
+        .with_available_themes(crate::theme::available_names());
     if let Some(error) = startup_error {
         app.show_error(error);
     } else if !warnings.is_empty() {

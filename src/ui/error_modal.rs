@@ -1,22 +1,26 @@
 //! A user-facing error overlay: error summary + log location + key hints.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::layout::centered_rect;
+use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, message: &str, log_location: &str, copied: bool) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    message: &str,
+    log_location: &str,
+    copied: bool,
+    theme: &Theme,
+) {
     let popup = centered_rect(64, 50, area);
     frame.render_widget(Clear, popup);
 
     let mut lines = vec![
-        Line::from(Span::styled(
-            "Something went wrong",
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled("Something went wrong", theme.error_text())),
         Line::from(""),
     ];
     for line in message.lines() {
@@ -25,7 +29,7 @@ pub fn render(frame: &mut Frame, area: Rect, message: &str, log_location: &str, 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("Log: {log_location}"),
-        Style::new().fg(Color::DarkGray),
+        theme.muted(),
     )));
     lines.push(Line::from(""));
     let hint = if copied {
@@ -33,11 +37,12 @@ pub fn render(frame: &mut Frame, area: Rect, message: &str, log_location: &str, 
     } else {
         "Enter  dismiss      y  copy log path"
     };
-    lines.push(Line::from(Span::styled(hint, Style::new().fg(Color::DarkGray))));
+    lines.push(Line::from(Span::styled(hint, theme.muted())));
 
     let block = Block::bordered()
         .title(" Error ")
-        .border_style(Style::new().fg(Color::Red));
+        .border_style(theme.error_border())
+        .style(theme.modal());
     frame.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
         popup,

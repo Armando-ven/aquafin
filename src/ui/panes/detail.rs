@@ -1,12 +1,11 @@
 //! Detail pane: the selected item's cover plus its metadata/description.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::border_style;
+use crate::theme::Theme;
 use crate::ui::app::Item;
 use crate::ui::images::Images;
 
@@ -16,15 +15,19 @@ pub fn render(
     item: Option<&Item>,
     focused: bool,
     images: Option<&mut Images>,
+    theme: &Theme,
 ) {
     let block = Block::bordered()
         .title(" Details ")
-        .border_style(border_style(focused));
+        .border_style(theme.border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let Some(item) = item else {
-        frame.render_widget(Paragraph::new("No item selected."), inner);
+        frame.render_widget(
+            Paragraph::new("No item selected.").style(theme.muted()),
+            inner,
+        );
         return;
     };
 
@@ -44,10 +47,7 @@ pub fn render(
         inner
     };
 
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        item.name.clone(),
-        Style::new().add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(item.name.clone(), theme.header()))];
 
     let mut meta: Vec<String> = Vec::new();
     if let Some(kind) = &item.kind {
@@ -60,19 +60,13 @@ pub fn render(
         meta.push(runtime);
     }
     if !meta.is_empty() {
-        lines.push(Line::from(Span::styled(
-            meta.join("  ·  "),
-            Style::new().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled(meta.join("  ·  "), theme.muted())));
     }
 
     lines.push(Line::from(""));
     match item.overview.as_deref().filter(|o| !o.is_empty()) {
         Some(overview) => lines.push(Line::from(overview.to_string())),
-        None => lines.push(Line::from(Span::styled(
-            "No description.",
-            Style::new().fg(Color::DarkGray),
-        ))),
+        None => lines.push(Line::from(Span::styled("No description.", theme.muted()))),
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);

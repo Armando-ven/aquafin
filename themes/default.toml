@@ -1,0 +1,15 @@
+# aquafin default theme — an original dark, aqua-accented scheme.
+name = "default"
+
+[palette]
+base = "#0e1416"
+surface = "#152025"
+overlay = "#23323a"
+text = "#cdd9de"
+subtext = "#7e94a0"
+accent = "#39bdb6"
+success = "#7fd1a0"
+warn = "#e6c478"
+error = "#e2747f"
+border = "#2a3a42"
+selection = "#1c4f50"

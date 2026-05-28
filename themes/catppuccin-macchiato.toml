@@ -1,0 +1,15 @@
+# Catppuccin Macchiato (dark). https://github.com/catppuccin/catppuccin
+name = "catppuccin-macchiato"
+
+[palette]
+base = "#24273a"
+surface = "#363a4f"
+overlay = "#494d64"
+text = "#cad3f5"
+subtext = "#a5adcb"
+accent = "#8aadf4"
+success = "#a6da95"
+warn = "#eed49f"
+error = "#ed8796"
+border = "#5b6078"
+selection = "#494d64"

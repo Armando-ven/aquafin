@@ -2,23 +2,20 @@
 //! (reflecting any `config.toml` rebindings), grouped by context.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::keymap::Keymap;
+use crate::theme::Theme;
 
-pub fn render(frame: &mut Frame, area: Rect, keymap: &Keymap) {
+pub fn render(frame: &mut Frame, area: Rect, keymap: &Keymap, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
     for group in keymap.describe() {
-        lines.push(Line::from(Span::styled(
-            group.title,
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )));
+        lines.push(Line::from(Span::styled(group.title, theme.cheatsheet_group())));
         for binding in group.bindings {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<14}", binding.keys), Style::new().fg(Color::Yellow)),
+                Span::styled(format!("  {:<14}", binding.keys), theme.cheatsheet_key()),
                 Span::raw(binding.desc),
             ]));
         }
@@ -32,7 +29,8 @@ pub fn render(frame: &mut Frame, area: Rect, keymap: &Keymap) {
 
     let block = Block::bordered()
         .title(" Keybindings — press any key to close ")
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(theme.modal_border())
+        .style(theme.modal());
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 

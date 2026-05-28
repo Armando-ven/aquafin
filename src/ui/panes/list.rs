@@ -2,15 +2,21 @@
 //! breadcrumb title. Folders are flagged so it's clear which entries open.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use super::{border_style, highlight_style};
+use crate::theme::Theme;
 use crate::ui::app::Level;
 
-pub fn render(frame: &mut Frame, area: Rect, level: Option<&Level>, breadcrumb: &str, focused: bool) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    level: Option<&Level>,
+    breadcrumb: &str,
+    focused: bool,
+    theme: &Theme,
+) {
     let title = if breadcrumb.is_empty() {
         " Items ".to_string()
     } else {
@@ -18,23 +24,26 @@ pub fn render(frame: &mut Frame, area: Rect, level: Option<&Level>, breadcrumb: 
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(border_style(focused));
+        .border_style(theme.border(focused));
 
     let Some(level) = level else {
-        frame.render_widget(Paragraph::new("No library.").block(block), area);
+        frame.render_widget(
+            Paragraph::new("No library.").style(theme.muted()).block(block),
+            area,
+        );
         return;
     };
 
     if level.loading {
         frame.render_widget(
-            Paragraph::new(Span::styled("Loading…", Style::new().fg(Color::DarkGray))).block(block),
+            Paragraph::new("Loading…").style(theme.muted()).block(block),
             area,
         );
         return;
     }
     if level.items.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("Empty.", Style::new().fg(Color::DarkGray))).block(block),
+            Paragraph::new("Empty.").style(theme.muted()).block(block),
             area,
         );
         return;
@@ -46,10 +55,10 @@ pub fn render(frame: &mut Frame, area: Rect, level: Option<&Level>, breadcrumb: 
         .enumerate()
         .map(|(index, item)| {
             let marker = if level.marks.contains(&index) { "● " } else { "  " };
-            // A trailing arrow signals an item you can drill into.
             let mut spans = vec![Span::raw(format!("{marker}{}", item.name))];
             if item.is_folder {
-                spans.push(Span::styled("  ›", Style::new().fg(Color::DarkGray)));
+                // A trailing arrow signals an item you can drill into.
+                spans.push(Span::styled("  ›", theme.folder_marker()));
             }
             ListItem::new(Line::from(spans))
         })
@@ -57,7 +66,8 @@ pub fn render(frame: &mut Frame, area: Rect, level: Option<&Level>, breadcrumb: 
 
     let list = List::new(list_items)
         .block(block)
-        .highlight_style(highlight_style(focused))
+        .style(theme.list_item())
+        .highlight_style(theme.selected_item(focused))
         .highlight_symbol("› ");
 
     let mut state = ListState::default();

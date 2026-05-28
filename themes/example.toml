@@ -1,0 +1,65 @@
+# aquafin theme — full reference.
+#
+# Copy this file to $XDG_CONFIG_HOME/aquafin/themes/<name>.toml (usually
+# ~/.config/aquafin/themes/<name>.toml), edit it, then select it with
+# `ui.theme = "<name>"` in config.toml, or pick it at runtime with the `t` key.
+#
+# A theme has two parts:
+#   [palette]    — named colors.
+#   [components] — per-UI-element styling that references palette names.
+#
+# Only the palette is required; every [components] entry is optional and falls
+# back to the default mapping shown in the comments below. So the smallest valid
+# theme is just a `name` and a `[palette]`.
+
+name = "example"
+
+# --- Palette ----------------------------------------------------------------
+# Colors may be:
+#   - hex:           "#1e1e2e"  or  "#abc"
+#   - named:         "red", "cyan", "bright-blue", "dark-gray", ...
+#   - 256-color idx: "239"
+[palette]
+base = "#0e1416"      # window background / text on accent
+surface = "#152025"   # bars and panels (status bar, modals)
+overlay = "#23323a"   # subtle fills (progress track, scrollbar)
+text = "#cdd9de"      # primary text
+subtext = "#7e94a0"   # secondary / muted text
+accent = "#39bdb6"    # focus, selection, highlights
+success = "#7fd1a0"   # success states
+warn = "#e6c478"      # warnings / cheatsheet keys
+error = "#e2747f"     # errors
+border = "#2a3a42"    # unfocused pane borders
+selection = "#1c4f50" # selected row when its pane is NOT focused
+
+# --- Components --------------------------------------------------------------
+# Each entry sets `fg` and/or `bg` (a palette name OR a literal color) and any of
+# these style flags: bold, italic, underline, dim, reversed.
+#
+# The values shown are the DEFAULTS — uncomment and edit to override.
+[components]
+# list_item          = { fg = "text" }                                  # normal list row
+# selected_item      = { fg = "base", bg = "accent", bold = true }      # selected row, focused pane
+# selected_item_blur = { fg = "text", bg = "selection" }                # selected row, unfocused pane
+# focused_border     = { fg = "accent", bold = true }                   # focused pane border
+# unfocused_border   = { fg = "border" }                                # unfocused pane border
+# status_bar         = { fg = "subtext", bg = "surface" }               # bottom status bar
+# hint               = { fg = "subtext", bg = "surface" }               # status-bar key hints
+# header             = { fg = "text", bold = true }                     # item title in the detail pane
+# muted              = { fg = "subtext" }                               # secondary metadata text
+# modal              = { fg = "text", bg = "surface" }                  # overlay/modal body
+# modal_border       = { fg = "accent", bold = true }                   # overlay/modal border
+# search_input       = { fg = "text" }                                  # search field text
+# scrollbar          = { fg = "overlay" }                               # scrollbars
+# cheatsheet_group   = { fg = "accent", bold = true }                   # F1 cheatsheet group titles
+# cheatsheet_key     = { fg = "warn" }                                  # F1 cheatsheet key names
+# now_playing_title  = { fg = "text", bold = true }                     # now-playing track/video title
+# now_playing_subtitle = { fg = "subtext" }                             # now-playing artist/subtitle
+# now_playing_meta   = { fg = "subtext", dim = true }                   # now-playing time/volume line
+# progress_bar       = { fg = "accent" }                                # filled part of progress gauges
+# progress_track     = { fg = "overlay" }                               # unfilled part of progress gauges
+# error_text         = { fg = "error", bold = true }                    # error modal text
+# error_border       = { fg = "error", bold = true }                    # error modal border
+# success_text       = { fg = "success", bold = true }                  # success states
+# warn_text          = { fg = "warn", bold = true }                     # warning states
+# folder_marker      = { fg = "subtext" }                               # the "›" on drillable folders
