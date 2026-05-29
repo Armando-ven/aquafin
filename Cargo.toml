@@ -3,7 +3,7 @@ name = "aquafin"
 version = "0.1.0"
 edition = "2021"
 description = "Jellyfin TUI client for the terminal."
-license = "MIT"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]
