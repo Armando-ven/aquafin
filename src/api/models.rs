@@ -94,6 +94,37 @@ pub struct BaseItemDto {
     pub user_data: Option<UserData>,
     pub image_tags: Option<HashMap<String, String>>,
     pub backdrop_image_tags: Option<Vec<String>>,
+    /// Cast and crew. Populated when `fields=People` is requested or when the
+    /// detail endpoint (`/Items/{id}`) is used.
+    pub people: Option<Vec<BaseItemPerson>>,
+    pub genres: Option<Vec<String>>,
+}
+
+/// A cast or crew member from a `BaseItemDto.People` entry.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct BaseItemPerson {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    /// e.g. `Actor`, `Director`, `Writer`, `GuestStar`.
+    #[serde(rename = "Type")]
+    pub type_: Option<String>,
+    pub role: Option<String>,
+}
+
+/// `GET /Items/{itemId}/Lyrics` response.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct LyricsDto {
+    pub lyrics: Vec<LyricLine>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct LyricLine {
+    pub text: String,
+    /// Optional timecode in 100 ns ticks; absent on plain-text lyrics.
+    pub start: Option<i64>,
 }
 
 /// Per-user playback state attached to an item.

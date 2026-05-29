@@ -31,6 +31,14 @@ pub enum Action {
     SeekForward,
     /// Skip backward by the configured number of seconds.
     SeekBackward,
+    /// Advance to the next queued track.
+    QueueNext,
+    /// Go back to the previous queued track.
+    QueuePrev,
+    /// Toggle shuffle on the active queue.
+    QueueShuffle,
+    /// Cycle repeat mode: None → All → One → None.
+    QueueRepeat,
     /// Open the theme picker.
     Themes,
     Help,
@@ -60,6 +68,10 @@ const ACTIONS: &[ActionSpec] = &[
     ActionSpec { action: Action::Stop, name: "stop", default_keys: "s", desc: "Stop audio", group: "Playback" },
     ActionSpec { action: Action::SeekForward, name: "seek_forward", default_keys: ">", desc: "Skip forward", group: "Playback" },
     ActionSpec { action: Action::SeekBackward, name: "seek_backward", default_keys: "<", desc: "Skip backward", group: "Playback" },
+    ActionSpec { action: Action::QueueNext, name: "queue_next", default_keys: "n", desc: "Next track", group: "Queue" },
+    ActionSpec { action: Action::QueuePrev, name: "queue_prev", default_keys: "p", desc: "Previous track", group: "Queue" },
+    ActionSpec { action: Action::QueueShuffle, name: "queue_shuffle", default_keys: "z", desc: "Toggle shuffle", group: "Queue" },
+    ActionSpec { action: Action::QueueRepeat, name: "queue_repeat", default_keys: "r", desc: "Cycle repeat mode", group: "Queue" },
     ActionSpec { action: Action::VolumeUp, name: "volume_up", default_keys: "+", desc: "Volume up", group: "Playback" },
     ActionSpec { action: Action::VolumeDown, name: "volume_down", default_keys: "-", desc: "Volume down", group: "Playback" },
     ActionSpec { action: Action::Favorite, name: "favorite", default_keys: "f", desc: "Toggle favorite", group: "Library" },

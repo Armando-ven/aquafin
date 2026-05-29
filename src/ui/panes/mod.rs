@@ -1,7 +1,8 @@
-//! The three content panes (sidebar / list / detail). Their styling comes from
-//! the active [`crate::theme::Theme`] (`theme.border(focused)`,
-//! `theme.selected_item(focused)`, etc.).
+//! The five content panes (top bar, library items, library sections, content,
+//! context). Styling comes from the active [`crate::theme::Theme`].
 
-pub mod detail;
-pub mod list;
-pub mod sidebar;
+pub mod content;
+pub mod context_pane;
+pub mod library_items;
+pub mod library_sections;
+pub mod top_bar;

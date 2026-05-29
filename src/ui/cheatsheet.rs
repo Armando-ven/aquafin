@@ -22,6 +22,19 @@ pub fn render(frame: &mut Frame, area: Rect, keymap: &Keymap, theme: &Theme) {
         lines.push(Line::from(""));
     }
 
+    // Built-ins not in the configurable keymap: top-bar shortcuts.
+    lines.push(Line::from(Span::styled("Top bar", theme.cheatsheet_group())));
+    for (key, desc) in [
+        ("1 – 9", "Switch library"),
+        ("/", "Open search · Enter to run · Esc to cancel"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<14}"), theme.cheatsheet_key()),
+            Span::raw(desc),
+        ]));
+    }
+    lines.push(Line::from(""));
+
     // Size the popup to its content (plus borders), clamped to the screen, so
     // adding bindings never clips the list.
     let popup = sized_center(&lines, area);

@@ -1,5 +1,6 @@
-//! Main list pane: the active drill level's items, with selection markers and a
-//! breadcrumb title. Folders are flagged so it's clear which entries open.
+//! Library items pane (left column, top 2/3): the active drill level's items,
+//! with selection markers and a breadcrumb title. Folders are flagged so it's
+//! clear which entries open.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};

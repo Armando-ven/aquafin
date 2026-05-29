@@ -4,6 +4,7 @@
 pub mod app;
 pub mod browse;
 pub mod cheatsheet;
+pub mod details;
 pub mod error_modal;
 pub mod images;
 pub mod keymap;
@@ -89,7 +90,11 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
     let mut app = app::App::with_libraries(libraries)
         .with_keymap(keys)
         .with_theme(theme)
-        .with_available_themes(crate::theme::available_names());
+        .with_available_themes(crate::theme::available_names())
+        .with_audio_prefs(config.audio.repeat_mode.into(), config.audio.shuffle)
+        .with_section_memory(config.ui.section_memory.clone())
+        .with_last_library(config.ui.last_library_id.clone())
+        .with_search_history(config.ui.search_history.clone());
     if let Some(error) = startup_error {
         app.show_error(error);
     } else if !warnings.is_empty() {
@@ -105,6 +110,7 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
             let mut browser = browse::Browser::new(runtime.handle().clone(), client.clone());
             let mut images =
                 images::Images::new(runtime.handle().clone(), client.clone(), config.ui.image_protocol);
+            let mut detail_fetcher = details::Details::new(runtime.handle().clone(), client.clone());
             let mut player = playback::Playback::new(
                 runtime.handle().clone(),
                 client,
@@ -117,12 +123,13 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
                 Some(&mut player),
                 Some(&mut browser),
                 Some(&mut images),
+                Some(&mut detail_fetcher),
             );
             // Tell the server we've stopped before the runtime goes away.
             player.shutdown(runtime);
             result
         }
-        None => app::run_browser(terminal, &mut app, None, None, None),
+        None => app::run_browser(terminal, &mut app, None, None, None, None),
     }
 }
 
@@ -155,6 +162,7 @@ fn load_libraries(
             libraries.push(app::Library {
                 id: view.id,
                 name: view.name.unwrap_or_else(|| "(library)".to_string()),
+                collection_type: view.collection_type,
                 items: result.items.into_iter().map(item_from_dto).collect(),
             });
         }

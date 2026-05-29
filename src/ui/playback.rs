@@ -86,19 +86,54 @@ impl Playback {
         match intent {
             Intent::Play { item, media } => match media {
                 MediaKind::Video => self.play_video(item, app),
-                MediaKind::Audio => self.start_audio(item, app),
+                MediaKind::Audio => {
+                    // Build a queue from the active level so the engine can
+                    // auto-advance to the next track without user input.
+                    app.build_queue_for(&item);
+                    self.start_audio(item, app);
+                }
                 MediaKind::Other => {}
             },
             Intent::TogglePause => self.toggle_pause(),
-            Intent::Stop => self.stop_audio(),
-            Intent::VolumeUp => self.audio.nudge_volume(VOLUME_STEP),
-            Intent::VolumeDown => self.audio.nudge_volume(-VOLUME_STEP),
+            Intent::Stop => {
+                app.clear_queue();
+                self.stop_audio();
+            }
+            Intent::VolumeUp => {
+                self.audio.nudge_volume(VOLUME_STEP);
+                app.queue_intent(Intent::SaveVolume(self.audio.current_volume()));
+            }
+            Intent::VolumeDown => {
+                self.audio.nudge_volume(-VOLUME_STEP);
+                app.queue_intent(Intent::SaveVolume(self.audio.current_volume()));
+            }
             Intent::SeekForward => self.seek(self.seek_seconds as i32),
             Intent::SeekBackward => self.seek(-(self.seek_seconds as i32)),
             Intent::SetFavorite { item_id, favorite } => self.set_favorite(item_id, favorite, app),
-            // Folder drilling is handled by the browser, theme switches by the
-            // run loop, not playback.
-            Intent::OpenFolder { .. } | Intent::SetTheme(_) => {}
+            Intent::QueueNext => {
+                if let Some(next) = app.advance_queue() {
+                    self.stop_audio();
+                    self.start_audio(next, app);
+                }
+            }
+            Intent::QueuePrev => {
+                if let Some(prev) = app.previous_in_queue() {
+                    self.stop_audio();
+                    self.start_audio(prev, app);
+                }
+            }
+            // Folder drilling / section refetch / search are handled by the
+            // browser; theme switches and pref saves by the run loop, not
+            // playback.
+            Intent::OpenFolder { .. }
+            | Intent::ApplySection { .. }
+            | Intent::Search { .. }
+            | Intent::SetTheme(_)
+            | Intent::SaveAudioPrefs { .. }
+            | Intent::SaveVolume(_)
+            | Intent::SaveSectionMemory(_)
+            | Intent::SaveLastLibrary(_)
+            | Intent::SaveSearchHistory(_) => {}
         }
     }
 
@@ -170,9 +205,13 @@ impl Playback {
         }
 
         // Track finished on its own? Its reporter notices the engine went idle
-        // and posts Stopped; we just drop our handle.
+        // and posts Stopped; we drop our handle and, if a queue is set, kick
+        // off the next track.
         if self.audio.take_finished() {
             self.audio_session = None;
+            if let Some(next) = app.advance_queue() {
+                self.start_audio(next, app);
+            }
         }
 
         if let Some(error) = self.audio.last_error() {

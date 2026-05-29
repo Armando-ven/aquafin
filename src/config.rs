@@ -35,6 +35,19 @@ pub struct ServerConfig {
 pub struct UiConfig {
     pub theme: String,
     pub image_protocol: ImageProtocol,
+    /// Per-library last-active section, keyed by Jellyfin library id, valued
+    /// by section name (e.g. `Albums`). Names survive `sections_for` changes
+    /// better than indices would.
+    #[serde(default)]
+    pub section_memory: std::collections::HashMap<String, String>,
+    /// Jellyfin library id the user was viewing when they last quit. The
+    /// app refocuses it on next launch.
+    #[serde(default)]
+    pub last_library_id: Option<String>,
+    /// Recent search queries (most recent first). Up/Down inside the search
+    /// input cycles through this list.
+    #[serde(default)]
+    pub search_history: Vec<String>,
 }
 
 impl Default for UiConfig {
@@ -42,6 +55,9 @@ impl Default for UiConfig {
         Self {
             theme: "default".to_string(),
             image_protocol: ImageProtocol::Auto,
+            section_memory: std::collections::HashMap::new(),
+            last_library_id: None,
+            search_history: Vec::new(),
         }
     }
 }
@@ -63,6 +79,24 @@ pub struct AudioConfig {
     pub volume: u8,
     /// How many seconds the seek_forward / seek_backward actions skip.
     pub seek_seconds: u32,
+    /// Persisted queue repeat mode (`off`, `all`, `one`). Defaults to `off`.
+    #[serde(default)]
+    pub repeat_mode: RepeatModePref,
+    /// Persisted shuffle on/off.
+    #[serde(default)]
+    pub shuffle: bool,
+}
+
+/// Repeat-mode value as serialized to TOML. Kept separate from
+/// [`crate::ui::app::RepeatMode`] so the runtime enum can evolve without
+/// breaking the config file format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepeatModePref {
+    #[default]
+    Off,
+    All,
+    One,
 }
 
 impl Default for AudioConfig {
@@ -70,6 +104,8 @@ impl Default for AudioConfig {
         Self {
             volume: 100,
             seek_seconds: 5,
+            repeat_mode: RepeatModePref::Off,
+            shuffle: false,
         }
     }
 }

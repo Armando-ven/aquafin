@@ -1,7 +1,7 @@
 //! Read-only library queries: views, item listings, detail, images, resume, search.
 
 use super::client::JellyfinClient;
-use super::models::{BaseItemDto, ImageResponse, ItemsQuery, ItemsResult, SearchHintResult};
+use super::models::{BaseItemDto, ImageResponse, ItemsQuery, ItemsResult, LyricsDto, SearchHintResult};
 use super::Result;
 
 impl JellyfinClient {
@@ -53,6 +53,13 @@ impl JellyfinClient {
             reqwest::Method::DELETE
         };
         self.send_no_content(self.request(method, &path)).await
+    }
+
+    /// `GET /Items/{itemId}/Lyrics` — synced or plain-text lyrics for an audio
+    /// item. Errors when the server has no lyrics for the track.
+    pub async fn lyrics(&self, item_id: &str) -> Result<LyricsDto> {
+        let path = format!("/Items/{item_id}/Lyrics");
+        self.send_json(self.get(&path)).await
     }
 
     /// `GET /Items/{itemId}/Images/Primary` — primary image bytes.
@@ -192,6 +199,57 @@ mod tests {
             .unwrap();
         assert_eq!(hints.total_record_count, 1);
         assert_eq!(hints.search_hints[0].name.as_deref(), Some("The Matrix"));
+    }
+
+    #[tokio::test]
+    async fn item_detail_carries_people_and_genres() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/Items/itm1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "itm1",
+                "Name": "The Matrix",
+                "Type": "Movie",
+                "Genres": ["Sci-Fi", "Action"],
+                "People": [
+                    { "Id": "p1", "Name": "Keanu Reeves", "Type": "Actor", "Role": "Neo" },
+                    { "Id": "p2", "Name": "Lana Wachowski", "Type": "Director" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let item = client_for(&server).await.item("itm1").await.unwrap();
+        let genres = item.genres.unwrap();
+        assert_eq!(genres, vec!["Sci-Fi", "Action"]);
+        let people = item.people.unwrap();
+        assert_eq!(people.len(), 2);
+        assert_eq!(people[0].name.as_deref(), Some("Keanu Reeves"));
+        assert_eq!(people[0].role.as_deref(), Some("Neo"));
+        assert_eq!(people[0].type_.as_deref(), Some("Actor"));
+        assert_eq!(people[1].type_.as_deref(), Some("Director"));
+    }
+
+    #[tokio::test]
+    async fn lyrics_endpoint_parses_synced_and_plain() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/Items/trk1/Lyrics"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Lyrics": [
+                    { "Text": "Line one", "Start": 0 },
+                    { "Text": "Line two", "Start": 30000000 },
+                    { "Text": "Untimed line" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let lyrics = client_for(&server).await.lyrics("trk1").await.unwrap();
+        assert_eq!(lyrics.lyrics.len(), 3);
+        assert_eq!(lyrics.lyrics[0].text, "Line one");
+        assert_eq!(lyrics.lyrics[0].start, Some(0));
+        assert_eq!(lyrics.lyrics[1].start, Some(30_000_000));
+        assert_eq!(lyrics.lyrics[2].start, None);
     }
 
     #[tokio::test]

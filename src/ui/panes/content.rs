@@ -1,4 +1,5 @@
-//! Detail pane: the selected item's cover plus its metadata/description.
+//! Content pane (middle column): the selected item's cover plus its
+//! metadata/description. Bigger than the side columns so cover art has room.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -18,7 +19,7 @@ pub fn render(
     theme: &Theme,
 ) {
     let block = Block::bordered()
-        .title(" Details ")
+        .title(" Content ")
         .border_style(theme.border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);

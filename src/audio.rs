@@ -153,6 +153,12 @@ impl AudioEngine {
         self.shared.has_track.load(Ordering::Relaxed)
     }
 
+    /// Current volume (0..=100). Useful for persisting to config after a
+    /// `nudge_volume` call.
+    pub fn current_volume(&self) -> u8 {
+        self.shared.volume.load(Ordering::Relaxed)
+    }
+
     /// Adjust volume by `delta` percentage points, clamped to 0..=100.
     pub fn nudge_volume(&self, delta: i16) {
         // Update the shared value immediately (atomically) so rapid nudges
