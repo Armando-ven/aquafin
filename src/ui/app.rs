@@ -579,6 +579,23 @@ impl App {
         self.stack.last_mut()
     }
 
+    /// The library root level (bottom of the drill stack). Shown in the left
+    /// items pane so the album/playlist/series list stays visible while the
+    /// middle pane drills into a folder.
+    pub fn root_level(&self) -> Option<&Level> {
+        self.stack.first()
+    }
+
+    /// The deepest drilled level — the middle pane's list when the user has
+    /// opened a folder. `None` while at the library root.
+    pub fn drilled_level(&self) -> Option<&Level> {
+        if self.is_drilled() {
+            self.stack.last()
+        } else {
+            None
+        }
+    }
+
     pub fn current_item(&self) -> Option<&Item> {
         self.current_level()
             .and_then(|level| level.items.get(level.selected))
@@ -1073,7 +1090,21 @@ impl App {
             self.apply_section(self.section_selected);
             return;
         }
-        let Some(item) = self.current_item().cloned() else {
+        // Enter on the root pane while drilled replaces the drilled stack, so
+        // opening a new album/playlist swaps the middle pane to its contents
+        // instead of pushing yet another level.
+        let item = if self.focus == Pane::LibraryItems {
+            if self.is_drilled() {
+                self.stack.truncate(1);
+            }
+            self.stack
+                .first()
+                .and_then(|l| l.items.get(l.selected))
+                .cloned()
+        } else {
+            self.current_item().cloned()
+        };
+        let Some(item) = item else {
             return;
         };
         if item.is_folder {
@@ -1090,7 +1121,8 @@ impl App {
         }
     }
 
-    /// Push a loading level for `item` and queue the fetch of its children.
+    /// Push a loading level for `item`, queue the fetch of its children, and
+    /// move focus to the middle pane where the children will render.
     fn drill_into(&mut self, item: &Item) {
         self.stack.push(Level {
             title: item.name.clone(),
@@ -1099,6 +1131,7 @@ impl App {
             selected: 0,
             loading: true,
         });
+        self.focus = Pane::Content;
         self.pending.push(Intent::OpenFolder {
             id: item.id.clone(),
             title: item.name.clone(),
@@ -1106,9 +1139,14 @@ impl App {
     }
 
     /// Go up one drill level; at a library root, drop focus to the top bar.
+    /// Popping the last drilled level while the middle pane has focus returns
+    /// focus to the left items pane so the user lands back on the parent list.
     fn go_back(&mut self) {
         if self.is_drilled() {
             self.stack.pop();
+            if !self.is_drilled() && self.focus == Pane::Content {
+                self.focus = Pane::LibraryItems;
+            }
         } else {
             self.focus = Pane::TopBar;
         }
@@ -1147,9 +1185,18 @@ impl App {
     fn cursor_down(&mut self) {
         match self.focus {
             Pane::LibraryItems => {
-                if let Some(level) = self.current_level_mut() {
+                if let Some(level) = self.stack.first_mut() {
                     if level.selected + 1 < level.items.len() {
                         level.selected += 1;
+                    }
+                }
+            }
+            Pane::Content => {
+                if self.is_drilled() {
+                    if let Some(level) = self.stack.last_mut() {
+                        if level.selected + 1 < level.items.len() {
+                            level.selected += 1;
+                        }
                     }
                 }
             }
@@ -1159,29 +1206,43 @@ impl App {
                     self.section_selected += 1;
                 }
             }
-            Pane::TopBar | Pane::Content | Pane::ContextTop | Pane::ContextBottom => {}
+            Pane::TopBar | Pane::ContextTop | Pane::ContextBottom => {}
         }
     }
 
     fn cursor_up(&mut self) {
         match self.focus {
             Pane::LibraryItems => {
-                if let Some(level) = self.current_level_mut() {
+                if let Some(level) = self.stack.first_mut() {
                     level.selected = level.selected.saturating_sub(1);
+                }
+            }
+            Pane::Content => {
+                if self.is_drilled() {
+                    if let Some(level) = self.stack.last_mut() {
+                        level.selected = level.selected.saturating_sub(1);
+                    }
                 }
             }
             Pane::LibrarySections => {
                 self.section_selected = self.section_selected.saturating_sub(1);
             }
-            Pane::TopBar | Pane::Content | Pane::ContextTop | Pane::ContextBottom => {}
+            Pane::TopBar | Pane::ContextTop | Pane::ContextBottom => {}
         }
     }
 
     fn go_top(&mut self) {
         match self.focus {
             Pane::LibraryItems => {
-                if let Some(level) = self.current_level_mut() {
+                if let Some(level) = self.stack.first_mut() {
                     level.selected = 0;
+                }
+            }
+            Pane::Content => {
+                if self.is_drilled() {
+                    if let Some(level) = self.stack.last_mut() {
+                        level.selected = 0;
+                    }
                 }
             }
             Pane::LibrarySections => self.section_selected = 0,
@@ -1192,8 +1253,15 @@ impl App {
     fn go_bottom(&mut self) {
         match self.focus {
             Pane::LibraryItems => {
-                if let Some(level) = self.current_level_mut() {
+                if let Some(level) = self.stack.first_mut() {
                     level.selected = level.items.len().saturating_sub(1);
+                }
+            }
+            Pane::Content => {
+                if self.is_drilled() {
+                    if let Some(level) = self.stack.last_mut() {
+                        level.selected = level.items.len().saturating_sub(1);
+                    }
                 }
             }
             Pane::LibrarySections => {
@@ -1215,11 +1283,15 @@ impl App {
         };
     }
 
-    /// Cycle focus back (Left). In a drilled list it first walks up the folder
-    /// stack (yazi-style) before changing pane.
+    /// Cycle focus back (Left). When focused on the middle pane while drilled
+    /// (yazi-style), Left first walks up the folder stack; popping the last
+    /// drilled level then restores focus to the left items pane.
     fn focus_prev_or_back(&mut self) {
-        if self.focus == Pane::LibraryItems && self.is_drilled() {
+        if self.focus == Pane::Content && self.is_drilled() {
             self.stack.pop();
+            if !self.is_drilled() {
+                self.focus = Pane::LibraryItems;
+            }
             return;
         }
         self.focus = match self.focus {
@@ -1489,11 +1561,13 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         theme,
     );
 
+    let root_level = app.root_level();
+    let root_title = root_level.map(|l| l.title.clone()).unwrap_or_default();
     panes::library_items::render(
         frame,
         regions.library_items,
-        app.current_level(),
-        &app.breadcrumb(),
+        root_level,
+        &root_title,
         app.focus == Pane::LibraryItems,
         theme,
     );
@@ -1512,6 +1586,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         frame,
         regions.content,
         app.current_item(),
+        app.drilled_level(),
         app.focus == Pane::Content,
         images.as_deref_mut(),
         theme,
@@ -1840,15 +1915,96 @@ mod tests {
 
     #[test]
     fn left_in_drilled_list_goes_up_a_level() {
-        // Initial focus is LibraryItems; Enter drills into the folder.
+        // Initial focus is LibraryItems; Enter drills into the folder, which
+        // now opens the children in the middle pane and moves focus there.
         let mut app = app_with_item("Series");
         app.handle_key(press(KeyCode::Enter)); // drill in
         let _ = app.take_intents();
         assert!(app.is_drilled());
-        assert_eq!(app.focus, Pane::LibraryItems);
-        app.handle_key(press(KeyCode::Left)); // pops the level, keeps list focus
+        assert_eq!(app.focus, Pane::Content);
+        app.handle_key(press(KeyCode::Left)); // pops the level, restores list focus
         assert!(!app.is_drilled());
         assert_eq!(app.focus, Pane::LibraryItems);
+    }
+
+    #[test]
+    fn drilling_renders_children_in_middle_pane_and_keeps_root_on_left() {
+        // Drilling opens the children in the middle "Content" pane (titled
+        // after the folder) while the left items pane stays on the library
+        // root list.
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Discovery", "MusicAlbum")],
+        }]);
+        app.handle_key(press(KeyCode::Enter)); // drill into Discovery
+        let _ = app.take_intents();
+        app.fill_level(
+            "id-Discovery",
+            vec![typed_item("One More Time", "Audio"), typed_item("Aerodynamic", "Audio")],
+        );
+        let out = rendered(&app, 140, 30);
+        // The left items pane still lists the album (root level).
+        assert!(out.contains("Discovery"), "{out}");
+        // The middle pane shows the folder's tracks.
+        assert!(out.contains("One More Time"), "{out}");
+        assert!(out.contains("Aerodynamic"), "{out}");
+    }
+
+    #[test]
+    fn cursor_in_middle_pane_walks_drilled_items() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Album", "MusicAlbum")],
+        }]);
+        app.handle_key(press(KeyCode::Enter)); // drill, focus → Content
+        let _ = app.take_intents();
+        app.fill_level(
+            "id-Album",
+            vec![
+                typed_item("Track A", "Audio"),
+                typed_item("Track B", "Audio"),
+                typed_item("Track C", "Audio"),
+            ],
+        );
+        assert_eq!(app.focus, Pane::Content);
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.current_item().unwrap().name, "Track B");
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.current_item().unwrap().name, "Track C");
+        // Enter on a drilled audio leaf queues a Play intent.
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::Play { media: MediaKind::Audio, item }] if item.name == "Track C"
+        ));
+    }
+
+    #[test]
+    fn enter_on_root_album_while_drilled_swaps_the_middle_pane() {
+        // Opening a different album from the root list should replace the
+        // drilled level rather than push another one on top.
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Disc One", "MusicAlbum"), typed_item("Disc Two", "MusicAlbum")],
+        }]);
+        app.handle_key(press(KeyCode::Enter)); // drill into Disc One, focus → Content
+        let _ = app.take_intents();
+        assert_eq!(app.stack.len(), 2);
+        // Walk back to the left items pane and pick the next album.
+        app.focus = Pane::LibraryItems;
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        // Still exactly one drilled level deep, now Disc Two.
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(app.stack.last().unwrap().parent_id, "id-Disc Two");
+        assert_eq!(app.focus, Pane::Content);
     }
 
     #[test]

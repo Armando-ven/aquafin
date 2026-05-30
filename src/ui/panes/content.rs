@@ -1,16 +1,78 @@
-//! Content pane (middle column): the selected item's cover plus its
-//! metadata/description. Bigger than the side columns so cover art has room.
+//! Content pane (middle column): the main window. When the user drills into a
+//! folder (album, playlist, series, season, …) this renders its children as a
+//! list; otherwise it shows the selected item's cover plus its
+//! metadata/description.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme::Theme;
-use crate::ui::app::Item;
+use crate::ui::app::{Item, Level};
 use crate::ui::images::Images;
 
 pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    item: Option<&Item>,
+    drilled: Option<&Level>,
+    focused: bool,
+    images: Option<&mut Images>,
+    theme: &Theme,
+) {
+    if let Some(level) = drilled {
+        render_drilled(frame, area, level, focused, theme);
+        return;
+    }
+    render_detail(frame, area, item, focused, images, theme);
+}
+
+fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, theme: &Theme) {
+    let block = Block::bordered()
+        .title(format!(" {} ", level.title))
+        .border_style(theme.border(focused));
+
+    if level.loading {
+        frame.render_widget(
+            Paragraph::new("Loading…").style(theme.muted()).block(block),
+            area,
+        );
+        return;
+    }
+    if level.items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Empty.").style(theme.muted()).block(block),
+            area,
+        );
+        return;
+    }
+
+    let list_items: Vec<ListItem> = level
+        .items
+        .iter()
+        .map(|item| {
+            let marker = if item.is_favorite { "♥ " } else { "  " };
+            let mut spans = vec![Span::raw(format!("{marker}{}", item.name))];
+            if item.is_folder {
+                spans.push(Span::styled("  ›", theme.folder_marker()));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(list_items)
+        .block(block)
+        .style(theme.list_item())
+        .highlight_style(theme.selected_item(focused))
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    state.select(Some(level.selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_detail(
     frame: &mut Frame,
     area: Rect,
     item: Option<&Item>,
