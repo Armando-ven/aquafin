@@ -1447,7 +1447,12 @@ pub(crate) fn run_browser(
                     }
                 }
                 Intent::SetTheme(name) => match crate::theme::load(&name) {
-                    Ok(theme) => app.set_theme(theme),
+                    Ok(theme) => {
+                        app.set_theme(theme);
+                        if let Err(e) = persist_theme(&name) {
+                            tracing::warn!(error = %e, "couldn't persist theme");
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(theme = %name, error = %e, "couldn't load theme");
                         app.show_error(format!("Couldn't load theme \"{name}\": {e}"));
@@ -1543,6 +1548,12 @@ fn persist_last_library(id: String) -> Result<()> {
 fn persist_search_history(history: Vec<String>) -> Result<()> {
     let mut config = crate::config::Config::load()?.unwrap_or_default();
     config.ui.search_history = history;
+    config.save()
+}
+
+fn persist_theme(name: &str) -> Result<()> {
+    let mut config = crate::config::Config::load()?.unwrap_or_default();
+    config.ui.theme = name.to_string();
     config.save()
 }
 
