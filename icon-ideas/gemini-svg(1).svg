@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="100%" height="100%">
+  <defs>
+    <linearGradient id="jellyfinGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#AA5CC3" />
+      <stop offset="100%" stop-color="#00A4DC" />
+    </linearGradient>
+    
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <rect x="16" y="32" width="224" height="192" rx="20" fill="#1A1B26" filter="url(#shadow)" />
+  
+  <path d="M16 52 C16 40.954 24.954 32 36 32 L220 32 C231.046 32 240 40.954 240 52 L240 68 L16 68 Z" fill="#24283B" />
+  
+  <circle cx="36" cy="50" r="6" fill="#F7768E" />
+  <circle cx="56" cy="50" r="6" fill="#E0AF68" />
+  <circle cx="76" cy="50" r="6" fill="#9ECE6A" />
+
+  <polyline points="40,110 65,130 40,150" fill="none" stroke="#F74C00" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" />
+  <rect x="75" y="142" width="20" height="8" rx="2" fill="#F74C00" />
+
+  <path d="M120 170 C130 110, 155 80, 200 70 C165 105, 175 140, 205 170 C175 155, 145 160, 120 170 Z" fill="url(#jellyfinGrad)" />
+  
+  <polygon points="144,115 144,145 168,130" fill="#FFFFFF" />
+</svg>

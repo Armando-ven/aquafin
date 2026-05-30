@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="jellyGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#22D3EE" />
+      <stop offset="40%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#1E3A8A" />
+    </linearGradient>
+
+    <linearGradient id="triGrad" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#C084FC" />
+      <stop offset="100%" stop-color="#6B21A8" />
+    </linearGradient>
+
+    <linearGradient id="tentacleGrad1" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#9333EA" />
+    </linearGradient>
+    <linearGradient id="tentacleGrad2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0EA5E9" />
+      <stop offset="100%" stop-color="#4F46E5" />
+    </linearGradient>
+
+    <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2DD4BF" />
+      <stop offset="50%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#A855F7" />
+    </linearGradient>
+
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="90" fill="#0B1120" />
+
+  <path d="M 165 464 L 116 464 Q 46 464 46 394 L 46 116 Q 46 46 116 46 L 396 46 Q 466 46 466 116 L 466 394 Q 466 464 396 464 L 347 464" 
+        fill="none" stroke="#253860" stroke-width="6" stroke-linecap="round" />
+
+  <g transform="translate(80, 80)">
+    <polyline points="0,0 20,20 0,40" fill="none" stroke="#6EE7B7" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" />
+    <line x1="34" y1="40" x2="60" y2="40" stroke="#6EE7B7" stroke-width="10" stroke-linecap="round" />
+  </g>
+
+  <g transform="translate(0, -15)">
+    <path d="M 176 250 C 150 290, 200 320, 160 370" fill="none" stroke="url(#tentacleGrad2)" stroke-width="12" stroke-linecap="round" opacity="0.8"/>
+    <path d="M 226 250 C 190 300, 250 330, 210 390" fill="none" stroke="url(#tentacleGrad1)" stroke-width="14" stroke-linecap="round" opacity="0.9"/>
+    <path d="M 286 250 C 320 300, 260 330, 300 390" fill="none" stroke="url(#tentacleGrad1)" stroke-width="14" stroke-linecap="round" opacity="0.9"/>
+    <path d="M 336 250 C 360 290, 310 320, 350 370" fill="none" stroke="url(#tentacleGrad2)" stroke-width="12" stroke-linecap="round" opacity="0.8"/>
+
+    <path d="M 196 250 C 170 310, 230 350, 180 410" fill="none" stroke="url(#tentacleGrad1)" stroke-width="14" stroke-linecap="round" />
+    <path d="M 256 250 C 230 320, 280 360, 250 430" fill="none" stroke="url(#tentacleGrad2)" stroke-width="18" stroke-linecap="round" />
+    <path d="M 316 250 C 340 310, 280 350, 330 410" fill="none" stroke="url(#tentacleGrad1)" stroke-width="14" stroke-linecap="round" />
+
+    <path d="M 130 250 C 130 130, 382 130, 382 250 C 394 275, 344 275, 332 250 C 320 225, 290 225, 278 250 C 266 275, 246 275, 234 250 C 222 225, 190 225, 178 250 C 166 275, 118 275, 130 250 Z" 
+          fill="url(#jellyGrad)" filter="url(#shadow)" />
+          
+    <ellipse cx="190" cy="145" rx="45" ry="15" transform="rotate(-20 190 145)" fill="#FFFFFF" opacity="0.15" />
+    <ellipse cx="155" cy="180" rx="12" ry="6" transform="rotate(-35 155 180)" fill="#FFFFFF" opacity="0.2" />
+
+    <polygon points="256,135 316,220 196,220" fill="none" stroke="url(#triGrad)" stroke-width="18" stroke-linejoin="round" />
+  </g>
+
+  <text x="256" y="415" font-family="system-ui, -apple-system, sans-serif" font-weight="800" font-size="76" fill="url(#textGrad)" text-anchor="middle" letter-spacing="1">aquafin</text>
+
+  <text x="256" y="470" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-weight="600" font-size="24" fill="#5A6D90" text-anchor="middle" letter-spacing="2">jellyfin tui client</text>
+</svg>
