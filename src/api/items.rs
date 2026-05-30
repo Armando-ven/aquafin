@@ -55,10 +55,10 @@ impl JellyfinClient {
         self.send_no_content(self.request(method, &path)).await
     }
 
-    /// `GET /Items/{itemId}/Lyrics` — synced or plain-text lyrics for an audio
+    /// `GET /Audio/{itemId}/Lyrics` — synced or plain-text lyrics for an audio
     /// item. Errors when the server has no lyrics for the track.
     pub async fn lyrics(&self, item_id: &str) -> Result<LyricsDto> {
-        let path = format!("/Items/{item_id}/Lyrics");
+        let path = format!("/Audio/{item_id}/Lyrics");
         self.send_json(self.get(&path)).await
     }
 
@@ -234,7 +234,7 @@ mod tests {
     async fn lyrics_endpoint_parses_synced_and_plain() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/Items/trk1/Lyrics"))
+            .and(path("/Audio/trk1/Lyrics"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Lyrics": [
                     { "Text": "Line one", "Start": 0 },
