@@ -1,31 +1,41 @@
-//! Content pane (middle column): the main window. When the user drills into a
-//! folder (album, playlist, series, season, …) this renders its children as a
-//! list; otherwise it shows the selected item's cover plus its
-//! metadata/description.
+//! Content pane (middle column): reserved for actual content — a drilled-in
+//! album's tracks, a series' episodes, a playlist's songs, etc. The focused
+//! item's cover, title, and description live in the info pane (right column
+//! top); this pane stays a placeholder until the user drills in.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme::Theme;
-use crate::ui::app::{Item, Level};
-use crate::ui::images::Images;
+use crate::ui::app::Level;
 
 pub fn render(
     frame: &mut Frame,
     area: Rect,
-    item: Option<&Item>,
     drilled: Option<&Level>,
     focused: bool,
-    images: Option<&mut Images>,
     theme: &Theme,
 ) {
     if let Some(level) = drilled {
         render_drilled(frame, area, level, focused, theme);
         return;
     }
-    render_detail(frame, area, item, focused, images, theme);
+    render_placeholder(frame, area, focused, theme);
+}
+
+fn render_placeholder(frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
+    let block = Block::bordered()
+        .title(" Content ")
+        .border_style(theme.border(focused));
+    frame.render_widget(
+        Paragraph::new("Select an album, playlist, or series, then press Enter to view its contents.")
+            .style(theme.muted())
+            .wrap(Wrap { trim: true })
+            .block(block),
+        area,
+    );
 }
 
 fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, theme: &Theme) {
@@ -72,71 +82,9 @@ fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, t
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_detail(
-    frame: &mut Frame,
-    area: Rect,
-    item: Option<&Item>,
-    focused: bool,
-    images: Option<&mut Images>,
-    theme: &Theme,
-) {
-    let block = Block::bordered()
-        .title(" Content ")
-        .border_style(theme.border(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let Some(item) = item else {
-        frame.render_widget(
-            Paragraph::new("No item selected.").style(theme.muted()),
-            inner,
-        );
-        return;
-    };
-
-    // Reserve the top of the pane for the cover when the item has one, the
-    // terminal can draw images, and there's room; text flows below it.
-    let has_art = item.primary_image_tag.is_some();
-    let can_draw_cover = images.as_ref().is_some_and(|im| im.is_available());
-    let text_area = if has_art && can_draw_cover && inner.height >= 10 {
-        let cover_height = inner.height * 3 / 5;
-        let [cover_area, text_area] =
-            Layout::vertical([Constraint::Length(cover_height), Constraint::Min(0)]).areas(inner);
-        if let Some(images) = images {
-            images.draw(frame, cover_area, &item.id);
-        }
-        text_area
-    } else {
-        inner
-    };
-
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(item.name.clone(), theme.header()))];
-
-    let mut meta: Vec<String> = Vec::new();
-    if let Some(kind) = &item.kind {
-        meta.push(kind.clone());
-    }
-    if let Some(year) = item.production_year {
-        meta.push(year.to_string());
-    }
-    if let Some(runtime) = item.run_time_ticks.and_then(format_runtime) {
-        meta.push(runtime);
-    }
-    if !meta.is_empty() {
-        lines.push(Line::from(Span::styled(meta.join("  ·  "), theme.muted())));
-    }
-
-    lines.push(Line::from(""));
-    match item.overview.as_deref().filter(|o| !o.is_empty()) {
-        Some(overview) => lines.push(Line::from(overview.to_string())),
-        None => lines.push(Line::from(Span::styled("No description.", theme.muted()))),
-    }
-
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);
-}
-
 /// Jellyfin `RunTimeTicks` (100 ns units) → a short `1h 56m` / `42m` string.
-fn format_runtime(ticks: i64) -> Option<String> {
+/// Used by the info pane.
+pub(crate) fn format_runtime(ticks: i64) -> Option<String> {
     if ticks <= 0 {
         return None;
     }

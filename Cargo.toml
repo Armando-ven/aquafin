@@ -15,7 +15,7 @@ image = "0.25.10"
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 libc = "0.2"
 opus = "0.3.1"
-ratatui = "0.30.0"
+ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 ratatui-image = "11.0.2"
 reqwest = { version = "0.13.4", features = ["json", "query"] }
 rodio = "0.22.2"

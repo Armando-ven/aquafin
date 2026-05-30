@@ -15,7 +15,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 
 use super::keymap::{Action, Keymap};
-use super::{cheatsheet, error_modal, layout, panes, theme_picker};
+use super::{cheatsheet, error_modal, layout, panes, popup_menu, theme_picker};
 use crate::theme::Theme;
 
 pub(crate) type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -115,6 +115,46 @@ pub enum Intent {
     SaveLastLibrary(String),
     /// Persist the (capped) recent-search-query list.
     SaveSearchHistory(Vec<String>),
+    /// Manually fetch detail (cast, lyrics, children, siblings) for the named
+    /// item. Triggered by the item-options popup; no longer auto-fetched.
+    LoadCurrentDetail { item_id: String, kind: Option<String> },
+}
+
+/// Which popup menu, if any, is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupMenu {
+    /// Item options for the focused list item (key: `p`).
+    Item(usize),
+    /// Client settings (key: `Shift+P`).
+    Client(usize),
+}
+
+/// Entries in the per-item options popup. The popup is built dynamically per
+/// item so audio-only / folder-only actions stay out of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemMenuAction {
+    LoadInfo,
+    ShowLyrics,
+    Play,
+    ToggleFavorite,
+}
+
+/// Which view the music top-right context pane is rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextTopView {
+    #[default]
+    Lyrics,
+    /// Item info: cover, description, contents list (artist's albums, etc).
+    Info,
+}
+
+/// Entries in the client-settings popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientMenuAction {
+    Themes,
+    ToggleShuffle,
+    CycleRepeat,
+    Quit,
 }
 
 /// Display-only snapshot of the active playback, written by the event loop each
@@ -248,6 +288,9 @@ pub struct LyricLine {
 /// Fetched detail for the currently-selected item.
 #[derive(Debug, Clone, Default)]
 pub struct ItemDetail {
+    /// The selected item's own metadata (Overview, name, etc) — re-fetched so
+    /// the info pane has a description even when the level row was sparse.
+    pub overview: Option<String>,
     /// Cast and crew (movies + tv).
     pub cast: Vec<Person>,
     pub genres: Vec<String>,
@@ -260,6 +303,10 @@ pub struct ItemDetail {
     /// Siblings of the selected item — items sharing its parent. Used so the
     /// TV context can show season-mates from a focused episode.
     pub siblings: Vec<Item>,
+    /// Albums credited to this artist (MusicArtist items only).
+    pub artist_albums: Vec<Item>,
+    /// Albums the artist contributes to but isn't the primary album-artist of.
+    pub appears_on: Vec<Item>,
 }
 
 /// In-place Fisher-Yates shuffle backed by a tiny linear-congruential PRNG
@@ -406,6 +453,21 @@ pub struct App {
     available_themes: Vec<String>,
     /// When the theme picker is open, the highlighted index into `available_themes`.
     theme_picker: Option<usize>,
+    /// Currently-open popup menu (item options or client settings), if any.
+    popup: Option<PopupMenu>,
+    /// Id of the item the user has explicitly revealed via the popup's "Load
+    /// info" action. While `None`, the middle pane shows a placeholder instead
+    /// of cover + title + description. Cleared when selection changes.
+    revealed_item_id: Option<String>,
+    /// Which view the music top-right pane renders (info or lyrics). Toggled
+    /// from the item-options popup.
+    context_view: ContextTopView,
+    /// Vertical scroll offset (in rows) for the right-top context pane when
+    /// it overflows. Reset on selection change or view switch.
+    context_top_scroll: u16,
+    /// Vertical scroll offset (in rows) for the right-bottom context pane
+    /// (queue / credits / seasons).
+    context_bottom_scroll: u16,
     /// Transient one-liner in the status bar (e.g. "Not playable"); cleared on the
     /// next key press.
     status_message: Option<String>,
@@ -486,6 +548,11 @@ impl App {
             theme: Theme::default(),
             available_themes: Vec::new(),
             theme_picker: None,
+            popup: None,
+            revealed_item_id: None,
+            context_view: ContextTopView::default(),
+            context_top_scroll: 0,
+            context_bottom_scroll: 0,
             status_message: None,
             pending: Vec::new(),
             error: None,
@@ -668,9 +735,60 @@ impl App {
     }
 
     /// Drop any cached detail (called when the selection changes so the
-    /// renderer doesn't show stale lyrics/cast).
+    /// renderer doesn't show stale lyrics/cast). Also drops the "revealed"
+    /// flag so the middle pane goes back to its placeholder, resets the
+    /// context-pane scroll, and snaps the music context back to lyrics.
     pub fn clear_current_detail(&mut self) {
         self.current_detail = None;
+        self.revealed_item_id = None;
+        self.context_top_scroll = 0;
+        self.context_bottom_scroll = 0;
+        self.context_view = ContextTopView::default();
+    }
+
+    pub fn context_view(&self) -> ContextTopView {
+        self.context_view
+    }
+
+    pub fn context_top_scroll(&self) -> u16 {
+        self.context_top_scroll
+    }
+
+    pub fn context_bottom_scroll(&self) -> u16 {
+        self.context_bottom_scroll
+    }
+
+    pub fn set_context_view(&mut self, view: ContextTopView) {
+        if self.context_view != view {
+            self.context_view = view;
+            self.context_top_scroll = 0;
+        }
+    }
+
+    /// Scroll the focused context pane (top or bottom). Falls back to the top
+    /// pane when neither has focus so PgUp/PgDn always do something useful.
+    fn scroll_focused_context(&mut self, delta: i32) {
+        let scroll = match self.focus {
+            Pane::ContextBottom => &mut self.context_bottom_scroll,
+            _ => &mut self.context_top_scroll,
+        };
+        let next = *scroll as i32 + delta;
+        *scroll = next.max(0) as u16;
+    }
+
+    /// True when the focused item has been explicitly revealed via the
+    /// item-options popup. Drives the middle pane (cover + title + description)
+    /// and the cover request gate.
+    pub fn current_item_revealed(&self) -> bool {
+        match (self.current_item(), &self.revealed_item_id) {
+            (Some(item), Some(id)) => item.id == *id,
+            _ => false,
+        }
+    }
+
+    /// Mark `item_id` as revealed (called when the user picks "Load info").
+    pub fn reveal_item(&mut self, item_id: String) {
+        self.revealed_item_id = Some(item_id);
     }
 
     /// Build the audio queue from the active level: every audio item in the
@@ -899,6 +1017,12 @@ impl App {
             return;
         }
 
+        // Any open popup menu captures input until closed.
+        if self.popup.is_some() {
+            self.handle_popup_key(key);
+            return;
+        }
+
         // The theme picker captures input while open.
         if let Some(selected) = self.theme_picker {
             match key.code {
@@ -979,6 +1103,10 @@ impl App {
             Action::QueueRepeat => self.cycle_repeat(),
             Action::Favorite => self.toggle_favorite(),
             Action::Themes => self.open_theme_picker(),
+            Action::ItemMenu => self.open_item_menu(),
+            Action::ClientMenu => self.open_client_menu(),
+            Action::InfoScrollUp => self.scroll_focused_context(-3),
+            Action::InfoScrollDown => self.scroll_focused_context(3),
             Action::Help => self.show_help = true,
             Action::Cancel => {}
         }
@@ -1068,6 +1196,183 @@ impl App {
             loading: true,
         }];
         self.pending.push(Intent::Search { query });
+    }
+
+    /// Popup state for the renderer: which menu is open and which entry is highlighted.
+    pub fn popup_menu(&self) -> Option<(&'static str, Vec<String>, usize)> {
+        match self.popup? {
+            PopupMenu::Item(selected) => {
+                let entries = self
+                    .item_menu_entries()
+                    .into_iter()
+                    .map(|(label, _)| label.to_string())
+                    .collect();
+                Some(("Item options", entries, selected))
+            }
+            PopupMenu::Client(selected) => {
+                let entries = self
+                    .client_menu_entries()
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect();
+                Some(("Client settings", entries, selected))
+            }
+        }
+    }
+
+    /// Entries shown in the per-item popup. Built from the focused item so the
+    /// list reflects what's actually possible (e.g. Play is hidden on folders).
+    fn item_menu_entries(&self) -> Vec<(&'static str, ItemMenuAction)> {
+        let mut entries: Vec<(&'static str, ItemMenuAction)> = Vec::new();
+        let Some(item) = self.current_item() else {
+            return entries;
+        };
+        let is_audio = matches!(MediaKind::classify(item.kind.as_deref()), MediaKind::Audio);
+        // Both view entries are present for audio so the user can always pick
+        // either lyrics or info; each entry switches the context pane to its
+        // view and fetches the data it needs.
+        if is_audio {
+            entries.push(("Show lyrics", ItemMenuAction::ShowLyrics));
+            entries.push(("Show info", ItemMenuAction::LoadInfo));
+        } else {
+            entries.push(("Load info", ItemMenuAction::LoadInfo));
+        }
+        let playable = !item.is_folder
+            && matches!(
+                MediaKind::classify(item.kind.as_deref()),
+                MediaKind::Video | MediaKind::Audio,
+            );
+        if playable {
+            entries.push(("Play", ItemMenuAction::Play));
+        }
+        let fav_label = if item.is_favorite {
+            "Remove from favorites"
+        } else {
+            "Add to favorites"
+        };
+        entries.push((fav_label, ItemMenuAction::ToggleFavorite));
+        entries
+    }
+
+    /// Entries shown in the client-settings popup. Labels carry the current
+    /// state so the user can see what they'd be toggling.
+    fn client_menu_entries(&self) -> Vec<(String, ClientMenuAction)> {
+        vec![
+            ("Theme…".to_string(), ClientMenuAction::Themes),
+            (
+                format!(
+                    "Shuffle: {}",
+                    if self.shuffle { "on" } else { "off" }
+                ),
+                ClientMenuAction::ToggleShuffle,
+            ),
+            (
+                format!("Repeat: {}", self.repeat_mode.label()),
+                ClientMenuAction::CycleRepeat,
+            ),
+            ("Quit".to_string(), ClientMenuAction::Quit),
+        ]
+    }
+
+    fn open_item_menu(&mut self) {
+        if self.current_item().is_none() {
+            return;
+        }
+        self.popup = Some(PopupMenu::Item(0));
+    }
+
+    fn open_client_menu(&mut self) {
+        self.popup = Some(PopupMenu::Client(0));
+    }
+
+    /// Route key input while a popup menu is open.
+    fn handle_popup_key(&mut self, key: KeyEvent) {
+        let Some(popup) = self.popup else { return };
+        let len = match popup {
+            PopupMenu::Item(_) => self.item_menu_entries().len(),
+            PopupMenu::Client(_) => self.client_menu_entries().len(),
+        };
+        if len == 0 {
+            self.popup = None;
+            return;
+        }
+        let selected = match popup {
+            PopupMenu::Item(i) | PopupMenu::Client(i) => i.min(len - 1),
+        };
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Up => {
+                let next = selected.saturating_sub(1);
+                self.popup = Some(match popup {
+                    PopupMenu::Item(_) => PopupMenu::Item(next),
+                    PopupMenu::Client(_) => PopupMenu::Client(next),
+                });
+            }
+            KeyCode::Down => {
+                let next = (selected + 1).min(len - 1);
+                self.popup = Some(match popup {
+                    PopupMenu::Item(_) => PopupMenu::Item(next),
+                    PopupMenu::Client(_) => PopupMenu::Client(next),
+                });
+            }
+            KeyCode::Enter => {
+                self.popup = None;
+                match popup {
+                    PopupMenu::Item(_) => {
+                        if let Some((_, action)) =
+                            self.item_menu_entries().into_iter().nth(selected)
+                        {
+                            self.activate_item_action(action);
+                        }
+                    }
+                    PopupMenu::Client(_) => {
+                        if let Some((_, action)) =
+                            self.client_menu_entries().into_iter().nth(selected)
+                        {
+                            self.activate_client_action(action);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_item_action(&mut self, action: ItemMenuAction) {
+        match action {
+            ItemMenuAction::LoadInfo => {
+                let Some(item) = self.current_item().cloned() else {
+                    return;
+                };
+                self.set_context_view(ContextTopView::Info);
+                self.pending.push(Intent::LoadCurrentDetail {
+                    item_id: item.id,
+                    kind: item.kind,
+                });
+            }
+            ItemMenuAction::ShowLyrics => {
+                self.set_context_view(ContextTopView::Lyrics);
+                // Lyrics still need the lyric body to be fetched; reuse the
+                // detail intent so the loop drives the request.
+                if let Some(item) = self.current_item().cloned() {
+                    self.pending.push(Intent::LoadCurrentDetail {
+                        item_id: item.id,
+                        kind: item.kind,
+                    });
+                }
+            }
+            ItemMenuAction::Play => self.activate(),
+            ItemMenuAction::ToggleFavorite => self.toggle_favorite(),
+        }
+    }
+
+    fn activate_client_action(&mut self, action: ClientMenuAction) {
+        match action {
+            ClientMenuAction::Themes => self.open_theme_picker(),
+            ClientMenuAction::ToggleShuffle => self.toggle_shuffle(),
+            ClientMenuAction::CycleRepeat => self.cycle_repeat(),
+            ClientMenuAction::Quit => self.should_quit = true,
+        }
     }
 
     /// Open the theme picker on the currently-active theme.
@@ -1206,7 +1511,9 @@ impl App {
                     self.section_selected += 1;
                 }
             }
-            Pane::TopBar | Pane::ContextTop | Pane::ContextBottom => {}
+            Pane::ContextTop => self.scroll_focused_context(1),
+            Pane::ContextBottom => self.scroll_focused_context(1),
+            Pane::TopBar => {}
         }
     }
 
@@ -1227,7 +1534,9 @@ impl App {
             Pane::LibrarySections => {
                 self.section_selected = self.section_selected.saturating_sub(1);
             }
-            Pane::TopBar | Pane::ContextTop | Pane::ContextBottom => {}
+            Pane::ContextTop => self.scroll_focused_context(-1),
+            Pane::ContextBottom => self.scroll_focused_context(-1),
+            Pane::TopBar => {}
         }
     }
 
@@ -1354,50 +1663,47 @@ pub(crate) fn run_browser(
     // (~200 ms each).
     const STABLE_TICKS: u8 = 2;
     let mut last_item_id: Option<String> = None;
-    let mut last_item_kind: Option<String> = None;
     let mut stable_ticks: u8 = 0;
     while !app.should_quit {
         // Snapshot the current selection so we can run the stability gate
         // without holding any borrows on `app`.
         let current = app
             .current_item()
-            .map(|item| (item.id.clone(), item.kind.clone(), item.primary_image_tag.is_some()));
-        let current_id = current.as_ref().map(|(id, _, _)| id.clone());
-        let current_kind = current.as_ref().and_then(|(_, k, _)| k.clone());
-        let has_art = current.as_ref().is_some_and(|(_, _, art)| *art);
+            .map(|item| (item.id.clone(), item.primary_image_tag.is_some()));
+        let current_id = current.as_ref().map(|(id, _)| id.clone());
+        let has_art = current.as_ref().is_some_and(|(_, art)| *art);
 
         if current_id == last_item_id {
             stable_ticks = stable_ticks.saturating_add(1);
         } else {
             // Selection moved — drop any cached detail so the renderer doesn't
-            // show last item's lyrics/cast while the new fetch is in flight.
+            // show last item's lyrics/cast.
             app.clear_current_detail();
             stable_ticks = 0;
             last_item_id = current_id.clone();
-            last_item_kind = current_kind.clone();
         }
         let gate_open = stable_ticks >= STABLE_TICKS;
 
+        let revealed = app.current_item_revealed();
         if let Some(im) = images.as_deref_mut() {
             im.tick();
-            if gate_open && has_art {
+            // Covers no longer auto-load on hover. The middle-pane cover is
+            // fetched once the user picks "Load info"; the now-playing cover
+            // stays unconditional so the bar always shows art while a track plays.
+            if gate_open && has_art && revealed {
                 if let Some(id) = &current_id {
                     im.request(id);
                 }
             }
-            // The now-playing cover is always wanted while something plays.
             if let Some(np) = &app.now_playing {
                 im.request(&np.item_id);
             }
         }
 
+        // Detail fetches no longer fire on hover — they're driven by the
+        // per-item popup menu's "Load info" action via `Intent::LoadCurrentDetail`.
         if let Some(dt) = details.as_deref_mut() {
             dt.tick(app);
-            if gate_open {
-                if let Some(id) = &current_id {
-                    dt.request(id, last_item_kind.as_deref());
-                }
-            }
         }
 
         terminal.draw(|frame| render(frame, app, images.as_deref_mut()))?;
@@ -1482,6 +1788,13 @@ pub(crate) fn run_browser(
                     if let Err(e) = persist_search_history(history) {
                         tracing::warn!(error = %e, "couldn't persist search history");
                     }
+                }
+                Intent::LoadCurrentDetail { item_id, kind } => {
+                    if let Some(dt) = details.as_deref_mut() {
+                        dt.request(&item_id, kind.as_deref());
+                    }
+                    app.reveal_item(item_id);
+                    app.set_status("Loading info…");
                 }
                 other => {
                     if let Some(pb) = playback.as_deref_mut() {
@@ -1596,10 +1909,8 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
     panes::content::render(
         frame,
         regions.content,
-        app.current_item(),
         app.drilled_level(),
         app.focus == Pane::Content,
-        images.as_deref_mut(),
         theme,
     );
 
@@ -1610,8 +1921,13 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         frame,
         regions.context_top,
         collection_type,
+        app.current_item(),
         detail,
+        app.context_view(),
+        app.context_top_scroll(),
+        app.current_item_revealed(),
         playback_position,
+        images.as_deref_mut(),
         app.focus == Pane::ContextTop,
         theme,
     );
@@ -1625,6 +1941,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         app.upcoming_queue(),
         app.repeat_mode,
         app.shuffle,
+        app.context_bottom_scroll(),
         app.focus == Pane::ContextBottom,
         theme,
     );
@@ -1653,6 +1970,9 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         );
     } else if let Some((names, selected)) = app.theme_picker() {
         theme_picker::render(frame, area, names, selected, theme.name(), theme);
+    } else if let Some((title, entries, selected)) = app.popup_menu() {
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        popup_menu::render(frame, area, title, &refs, selected, theme);
     } else if app.show_help {
         cheatsheet::render(frame, area, &app.keymap, theme);
     }
@@ -2143,7 +2463,10 @@ mod tests {
     }
 
     #[test]
-    fn detail_pane_shows_real_metadata() {
+    fn middle_pane_is_placeholder_until_drilled() {
+        // Middle pane is reserved for an album/playlist/series' contents and
+        // stays a placeholder until the user drills into a folder. The focused
+        // item's metadata renders in the info pane (right column top) instead.
         let app = App::with_libraries(vec![Library {
             id: "movies".to_string(),
             name: "Movies".to_string(),
@@ -2161,9 +2484,26 @@ mod tests {
             }],
         }]);
         let out = rendered(&app, 120, 30);
-        assert!(out.contains("Neo learns the truth"));
-        assert!(out.contains("1999"));
-        assert!(out.contains("Movie"));
+        assert!(out.contains("Select an album"), "{out}");
+        assert!(!out.contains("Neo learns the truth"), "{out}");
+    }
+
+    #[test]
+    fn selection_change_hides_revealed_details() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "movies".to_string(),
+            name: "Movies".to_string(),
+            collection_type: Some("movies".to_string()),
+            items: vec![
+                Item { id: "1".to_string(), name: "A".to_string(), ..Default::default() },
+                Item { id: "2".to_string(), name: "B".to_string(), ..Default::default() },
+            ],
+        }]);
+        app.reveal_item("1".to_string());
+        assert!(app.current_item_revealed());
+        // clear_current_detail mirrors what the run loop does on selection move.
+        app.clear_current_detail();
+        assert!(!app.current_item_revealed());
     }
 
     #[test]
@@ -2546,10 +2886,189 @@ mod tests {
     }
 
     #[test]
-    fn n_and_p_keys_emit_queue_nav_intents() {
+    fn info_view_lists_artist_albums_and_appears_on_with_liked_marker() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![Item {
+                id: "artist-1".to_string(),
+                name: "Daft Punk".to_string(),
+                kind: Some("MusicArtist".to_string()),
+                is_folder: true,
+                ..Default::default()
+            }],
+        }]);
+        app.reveal_item("artist-1".to_string());
+        app.set_context_view(ContextTopView::Info);
+        app.set_current_detail(
+            "artist-1",
+            ItemDetail {
+                overview: Some("French electronic duo.".to_string()),
+                artist_albums: vec![
+                    Item {
+                        id: "alb-1".to_string(),
+                        name: "Discovery".to_string(),
+                        is_favorite: true,
+                        ..Default::default()
+                    },
+                    Item {
+                        id: "alb-2".to_string(),
+                        name: "Random Access Memories".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                appears_on: vec![Item {
+                    id: "alb-3".to_string(),
+                    name: "Tron: Legacy OST".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let out = rendered(&app, 140, 40);
+        assert!(out.contains("French electronic duo"), "{out}");
+        assert!(out.contains("Albums"), "{out}");
+        assert!(out.contains("Appears on"), "{out}");
+        assert!(out.contains("Discovery"), "{out}");
+        assert!(out.contains("Tron: Legacy OST"), "{out}");
+        // Liked album shows a heart marker.
+        assert!(out.contains("♥ Discovery"), "{out}");
+    }
+
+    #[test]
+    fn info_pane_renders_scrollbar_when_content_overflows() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![Item {
+                id: "artist-1".to_string(),
+                name: "Prolific Artist".to_string(),
+                kind: Some("MusicArtist".to_string()),
+                is_folder: true,
+                ..Default::default()
+            }],
+        }]);
+        app.reveal_item("artist-1".to_string());
+        app.set_context_view(ContextTopView::Info);
+        let many_albums: Vec<Item> = (0..50)
+            .map(|i| Item {
+                id: format!("alb-{i}"),
+                name: format!("Album {i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.set_current_detail(
+            "artist-1",
+            ItemDetail {
+                overview: Some("Long discography.".to_string()),
+                artist_albums: many_albums,
+                ..Default::default()
+            },
+        );
+        let out = rendered(&app, 140, 24);
+        // Ratatui's default vertical scrollbar uses unicode block glyphs for
+        // the thumb and track; either appearing in the buffer proves it drew.
+        let has_glyph = out.contains('█') || out.contains('░') || out.contains('▐');
+        assert!(has_glyph, "expected scrollbar glyph, got:\n{out}");
+    }
+
+    #[test]
+    fn show_info_menu_entry_switches_view_and_emits_intent() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Track A", "Audio")],
+        }]);
+        app.handle_key(press(KeyCode::Char('p')));
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        // Audio always exposes both view entries so lyrics can be loaded even
+        // when the pane defaults to the lyrics view.
+        assert_eq!(entries[0], "Show lyrics");
+        assert_eq!(entries[1], "Show info");
+        // Pick "Show info" (second entry).
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.context_view(), ContextTopView::Info);
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::LoadCurrentDetail { .. }]
+        ));
+    }
+
+    #[test]
+    fn show_lyrics_menu_entry_switches_view_and_fetches() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Track A", "Audio")],
+        }]);
+        // Flip to info view first, then back to lyrics via the popup.
+        app.set_context_view(ContextTopView::Info);
+        app.handle_key(press(KeyCode::Char('p')));
+        // First entry is "Show lyrics" — Enter selects it.
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.context_view(), ContextTopView::Lyrics);
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::LoadCurrentDetail { .. }]
+        ));
+    }
+
+    #[test]
+    fn p_opens_item_menu_and_load_info_emits_intent() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        // Menu is open with "Load info" highlighted first.
+        let (title, entries, sel) = app.popup_menu().expect("item menu open");
+        assert_eq!(title, "Item options");
+        assert_eq!(sel, 0);
+        assert_eq!(entries[0], "Load info");
+        // Enter on "Load info" closes the menu and queues a detail fetch.
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.popup_menu().is_none());
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::LoadCurrentDetail { item_id, .. }] if item_id == "id-Thing"
+        ));
+    }
+
+    #[test]
+    fn shift_p_opens_client_menu_and_quit_entry_quits() {
+        let mut app = App::new();
+        // Shift+p arrives as Char('P') + SHIFT modifier.
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        let (title, entries, _) = app.popup_menu().expect("client menu open");
+        assert_eq!(title, "Client settings");
+        assert!(entries.iter().any(|e| e == "Theme…"));
+        // Walk to the "Quit" entry (last) and activate.
+        for _ in 0..entries.len() - 1 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.popup_menu().is_none());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_closes_popup_without_action() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        assert!(app.popup_menu().is_some());
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.popup_menu().is_none());
+        assert!(app.take_intents().is_empty());
+    }
+
+    #[test]
+    fn queue_nav_keys_emit_intents() {
+        // `p` is reserved for the item-options popup; `b` walks back.
         let mut app = App::new();
         app.handle_key(press(KeyCode::Char('n')));
-        app.handle_key(press(KeyCode::Char('p')));
+        app.handle_key(press(KeyCode::Char('b')));
         assert_eq!(
             app.take_intents(),
             vec![Intent::QueueNext, Intent::QueuePrev]
@@ -2649,9 +3168,7 @@ mod tests {
                 kind: Some("Actor".to_string()),
             }],
             genres: vec!["Sci-Fi".to_string()],
-            lyrics: None,
-            children: Vec::new(),
-            siblings: Vec::new(),
+            ..Default::default()
         };
         // Matching id is accepted.
         app.set_current_detail("id-Thing", detail.clone());
@@ -2667,7 +3184,7 @@ mod tests {
     fn cheatsheet_includes_top_bar_built_ins() {
         let mut app = App::new();
         app.show_help = true;
-        let out = rendered(&app, 120, 40);
+        let out = rendered(&app, 120, 60);
         assert!(out.contains("Top bar"), "{out}");
         assert!(out.contains("1 – 9"), "{out}");
         assert!(out.contains("Switch library"));

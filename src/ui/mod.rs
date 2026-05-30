@@ -12,6 +12,7 @@ pub mod layout;
 pub mod now_playing;
 pub mod panes;
 pub mod playback;
+pub mod popup_menu;
 pub mod theme_picker;
 pub mod wizard;
 

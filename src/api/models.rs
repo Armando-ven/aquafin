@@ -160,6 +160,12 @@ pub struct ItemsQuery {
     pub recursive: Option<bool>,
     pub start_index: Option<u32>,
     pub limit: Option<u32>,
+    /// Filter to items whose AlbumArtist matches one of these ids. Used to
+    /// fetch the albums credited to an artist.
+    pub album_artist_ids: Vec<String>,
+    /// Filter to items whose contributing artists include one of these ids.
+    /// Used for an artist's "appears on" list.
+    pub artist_ids: Vec<String>,
 }
 
 impl ItemsQuery {
@@ -189,6 +195,12 @@ impl ItemsQuery {
         }
         if let Some(v) = self.limit {
             pairs.push(("limit", v.to_string()));
+        }
+        if !self.album_artist_ids.is_empty() {
+            pairs.push(("albumArtistIds", self.album_artist_ids.join(",")));
+        }
+        if !self.artist_ids.is_empty() {
+            pairs.push(("artistIds", self.artist_ids.join(",")));
         }
         pairs
     }

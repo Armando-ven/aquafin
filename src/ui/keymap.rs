@@ -41,6 +41,14 @@ pub enum Action {
     QueueRepeat,
     /// Open the theme picker.
     Themes,
+    /// Open the per-item options menu.
+    ItemMenu,
+    /// Open the client settings menu.
+    ClientMenu,
+    /// Scroll the info pane up (independent of pane focus).
+    InfoScrollUp,
+    /// Scroll the info pane down (independent of pane focus).
+    InfoScrollDown,
     Help,
     Cancel,
 }
@@ -69,13 +77,17 @@ const ACTIONS: &[ActionSpec] = &[
     ActionSpec { action: Action::SeekForward, name: "seek_forward", default_keys: ">", desc: "Skip forward", group: "Playback" },
     ActionSpec { action: Action::SeekBackward, name: "seek_backward", default_keys: "<", desc: "Skip backward", group: "Playback" },
     ActionSpec { action: Action::QueueNext, name: "queue_next", default_keys: "n", desc: "Next track", group: "Queue" },
-    ActionSpec { action: Action::QueuePrev, name: "queue_prev", default_keys: "p", desc: "Previous track", group: "Queue" },
+    ActionSpec { action: Action::QueuePrev, name: "queue_prev", default_keys: "b", desc: "Previous track", group: "Queue" },
     ActionSpec { action: Action::QueueShuffle, name: "queue_shuffle", default_keys: "z", desc: "Toggle shuffle", group: "Queue" },
     ActionSpec { action: Action::QueueRepeat, name: "queue_repeat", default_keys: "r", desc: "Cycle repeat mode", group: "Queue" },
     ActionSpec { action: Action::VolumeUp, name: "volume_up", default_keys: "+", desc: "Volume up", group: "Playback" },
     ActionSpec { action: Action::VolumeDown, name: "volume_down", default_keys: "-", desc: "Volume down", group: "Playback" },
     ActionSpec { action: Action::Favorite, name: "favorite", default_keys: "f", desc: "Toggle favorite", group: "Library" },
     ActionSpec { action: Action::Themes, name: "themes", default_keys: "t", desc: "Pick a theme", group: "General" },
+    ActionSpec { action: Action::ItemMenu, name: "item_menu", default_keys: "p", desc: "Open item menu", group: "General" },
+    ActionSpec { action: Action::ClientMenu, name: "client_menu", default_keys: "P", desc: "Open client settings", group: "General" },
+    ActionSpec { action: Action::InfoScrollUp, name: "info_scroll_up", default_keys: "pageup", desc: "Scroll info pane up", group: "General" },
+    ActionSpec { action: Action::InfoScrollDown, name: "info_scroll_down", default_keys: "pagedown", desc: "Scroll info pane down", group: "General" },
     ActionSpec { action: Action::Help, name: "help", default_keys: "f1", desc: "Toggle help", group: "General" },
     ActionSpec { action: Action::Cancel, name: "cancel", default_keys: "esc", desc: "Close overlay / cancel", group: "General" },
     ActionSpec { action: Action::Quit, name: "quit", default_keys: "q", desc: "Quit", group: "General" },

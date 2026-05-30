@@ -54,10 +54,20 @@ impl Details {
         let tx = self.tx.clone();
         let id = item_id.to_string();
         let is_audio = matches!(kind, Some("Audio" | "AudioBook"));
-        let wants_children = matches!(kind, Some("Series" | "Season"));
+        let wants_children = matches!(kind, Some("Series" | "Season" | "MusicAlbum"));
         let wants_siblings = matches!(kind, Some("Episode" | "Season"));
+        let wants_artist_discography = matches!(kind, Some("MusicArtist"));
         self.rt.spawn(async move {
-            match fetch_detail(&client, &id, is_audio, wants_children, wants_siblings).await {
+            match fetch_detail(
+                &client,
+                &id,
+                is_audio,
+                wants_children,
+                wants_siblings,
+                wants_artist_discography,
+            )
+            .await
+            {
                 Some(detail) => {
                     let _ = tx.send(DetailResult { id, detail });
                 }
@@ -82,6 +92,7 @@ pub(crate) async fn fetch_detail(
     is_audio: bool,
     wants_children: bool,
     wants_siblings: bool,
+    wants_artist_discography: bool,
 ) -> Option<ItemDetail> {
     let item = match client.item(id).await {
         Ok(dto) => dto,
@@ -134,13 +145,79 @@ pub(crate) async fn fetch_detail(
     } else {
         Vec::new()
     };
+    let (artist_albums, appears_on) = if wants_artist_discography {
+        let albums = fetch_artist_albums(client, id).await;
+        let appears = fetch_appears_on(client, id, &albums).await;
+        (albums, appears)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     Some(ItemDetail {
+        overview: item.overview.clone(),
         cast,
         genres,
         lyrics,
         children,
         siblings,
+        artist_albums,
+        appears_on,
     })
+}
+
+/// Albums credited to the artist as the primary album artist.
+async fn fetch_artist_albums(client: &JellyfinClient, artist_id: &str) -> Vec<super::app::Item> {
+    let query = ItemsQuery {
+        include_item_types: vec!["MusicAlbum".to_string()],
+        album_artist_ids: vec![artist_id.to_string()],
+        recursive: Some(true),
+        sort_by: vec!["ProductionYear".to_string(), "SortName".to_string()],
+        fields: vec!["Overview".to_string()],
+        limit: Some(200),
+        ..Default::default()
+    };
+    match client.items(&query).await {
+        Ok(result) => result
+            .items
+            .into_iter()
+            .map(super::item_from_dto)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(artist = %artist_id, error = %e, "couldn't fetch artist albums");
+            Vec::new()
+        }
+    }
+}
+
+/// Albums where the artist contributes but isn't the primary album artist
+/// (i.e. ArtistIds match minus the AlbumArtistIds set).
+async fn fetch_appears_on(
+    client: &JellyfinClient,
+    artist_id: &str,
+    own_albums: &[super::app::Item],
+) -> Vec<super::app::Item> {
+    let query = ItemsQuery {
+        include_item_types: vec!["MusicAlbum".to_string()],
+        artist_ids: vec![artist_id.to_string()],
+        recursive: Some(true),
+        sort_by: vec!["ProductionYear".to_string(), "SortName".to_string()],
+        fields: vec!["Overview".to_string()],
+        limit: Some(200),
+        ..Default::default()
+    };
+    let own: std::collections::HashSet<&str> =
+        own_albums.iter().map(|i| i.id.as_str()).collect();
+    match client.items(&query).await {
+        Ok(result) => result
+            .items
+            .into_iter()
+            .map(super::item_from_dto)
+            .filter(|item| !own.contains(item.id.as_str()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(artist = %artist_id, error = %e, "couldn't fetch appears-on");
+            Vec::new()
+        }
+    }
 }
 
 async fn fetch_children(client: &JellyfinClient, parent_id: &str) -> Vec<super::app::Item> {
@@ -194,7 +271,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let detail = fetch_detail(&client_for(&server).await, "m1", false, false, false)
+        let detail = fetch_detail(&client_for(&server).await, "m1", false, false, false, false)
             .await
             .unwrap();
         assert_eq!(detail.cast.len(), 1);
@@ -231,7 +308,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let detail = fetch_detail(&client_for(&server).await, "series1", false, true, false)
+        let detail = fetch_detail(&client_for(&server).await, "series1", false, true, false, false)
             .await
             .unwrap();
         assert_eq!(detail.children.len(), 2);
@@ -265,7 +342,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let detail = fetch_detail(&client_for(&server).await, "ep2", false, false, true)
+        let detail = fetch_detail(&client_for(&server).await, "ep2", false, false, true, false)
             .await
             .unwrap();
         assert_eq!(detail.siblings.len(), 2);

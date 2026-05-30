@@ -10,29 +10,213 @@
 
 use std::time::Duration;
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
 
 use crate::theme::Theme;
-use crate::ui::app::{Item, ItemDetail, LyricLine, NowPlaying, Person, RepeatMode};
+use crate::ui::app::{ContextTopView, Item, ItemDetail, LyricLine, NowPlaying, Person, RepeatMode};
+use crate::ui::images::Images;
+use crate::ui::panes::content::format_runtime;
 
 pub fn render_top(
     frame: &mut Frame,
     area: Rect,
     collection_type: Option<&str>,
+    item: Option<&Item>,
     detail: Option<&ItemDetail>,
+    view: ContextTopView,
+    scroll: u16,
+    revealed: bool,
     position: Option<Duration>,
+    images: Option<&mut Images>,
     focused: bool,
     theme: &Theme,
 ) {
     match collection_type {
-        Some("music") => render_lyrics(frame, area, detail, position, focused, theme),
-        Some("movies") => render_cast(frame, area, detail, focused, theme),
-        Some("tvshows") => render_tv_episodes(frame, area, detail, focused, theme),
+        Some("music") => match view {
+            ContextTopView::Lyrics => render_lyrics(frame, area, detail, position, focused, theme),
+            ContextTopView::Info => render_info(
+                frame, area, item, detail, scroll, revealed, images, focused, theme,
+            ),
+        },
+        Some("movies") => render_cast(frame, area, detail, scroll, focused, theme),
+        Some("tvshows") => render_tv_episodes(frame, area, detail, scroll, focused, theme),
         _ => render_placeholder(frame, area, " Info ", "Select an item.", focused, theme),
     }
+}
+
+/// Music info pane: cover + description + contents. For a MusicArtist the
+/// contents are the artist's albums and "appears on"; for a MusicAlbum it's
+/// the track list; for an Audio item the sibling tracks on the same album.
+fn render_info(
+    frame: &mut Frame,
+    area: Rect,
+    item: Option<&Item>,
+    detail: Option<&ItemDetail>,
+    scroll: u16,
+    revealed: bool,
+    images: Option<&mut Images>,
+    focused: bool,
+    theme: &Theme,
+) {
+    let block = Block::bordered()
+        .title(" Info ")
+        .border_style(theme.border(focused));
+    let Some(item) = item else {
+        frame.render_widget(
+            Paragraph::new("Select an item.").style(theme.muted()).block(block),
+            area,
+        );
+        return;
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Reserve a slice of the pane for the cover when the item has art, the
+    // user has revealed the item, and the terminal can draw images.
+    let has_art = item.primary_image_tag.is_some();
+    let can_draw_cover = images.as_ref().is_some_and(|im| im.is_available());
+    let text_area = if revealed && has_art && can_draw_cover && inner.height >= 10 {
+        let cover_height = (inner.height / 3).clamp(6, 14);
+        let [cover_area, text_area] =
+            Layout::vertical([Constraint::Length(cover_height), Constraint::Min(0)]).areas(inner);
+        if let Some(images) = images {
+            images.draw(frame, cover_area, &item.id);
+        }
+        text_area
+    } else {
+        inner
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(item.name.clone(), theme.header())));
+
+    let mut meta: Vec<String> = Vec::new();
+    if let Some(kind) = &item.kind {
+        meta.push(kind.clone());
+    }
+    if let Some(year) = item.production_year {
+        meta.push(year.to_string());
+    }
+    if let Some(runtime) = item.run_time_ticks.and_then(format_runtime) {
+        meta.push(runtime);
+    }
+    if !meta.is_empty() {
+        lines.push(Line::from(Span::styled(meta.join("  ·  "), theme.muted())));
+    }
+    lines.push(Line::from(""));
+
+    let overview = detail
+        .and_then(|d| d.overview.as_deref())
+        .or(item.overview.as_deref())
+        .filter(|o| !o.is_empty());
+    match overview {
+        Some(text) => lines.push(Line::from(text.to_string())),
+        None => match detail {
+            None => lines.push(Line::from(Span::styled("Loading…", theme.muted()))),
+            Some(_) => lines.push(Line::from(Span::styled("No description.", theme.muted()))),
+        },
+    }
+    lines.push(Line::from(""));
+
+    if let Some(detail) = detail {
+        match item.kind.as_deref() {
+            Some("MusicArtist") => {
+                push_section(&mut lines, "Albums", &detail.artist_albums, theme);
+                push_section(&mut lines, "Appears on", &detail.appears_on, theme);
+            }
+            Some("MusicAlbum") => {
+                push_section(&mut lines, "Tracks", &detail.children, theme);
+            }
+            Some("Audio" | "AudioBook") => {
+                push_section(&mut lines, "Album tracks", &detail.siblings, theme);
+            }
+            _ => {}
+        }
+        if !detail.genres.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Genres: {}", detail.genres.join(", ")),
+                theme.muted(),
+            )));
+        }
+    }
+
+    render_scrollable_paragraph(frame, text_area, lines, scroll, theme);
+}
+
+/// Render `lines` into `area` as a wrapped paragraph with a right-edge
+/// scrollbar that surfaces only when the wrapped content exceeds the viewport.
+/// `area` should already exclude the surrounding block's border.
+fn render_scrollable_paragraph(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    theme: &Theme,
+) {
+    let viewport = area.height;
+    // Reserve the rightmost column for the scrollbar so wrap accounting
+    // matches what's actually drawn.
+    let wrap_width = area.width.saturating_sub(1).max(1);
+    let paragraph = Paragraph::new(lines)
+        .style(theme.list_item())
+        .wrap(Wrap { trim: true });
+    let content_rows = paragraph.line_count(wrap_width) as u16;
+    let max_scroll = content_rows.saturating_sub(viewport);
+    let effective_scroll = scroll.min(max_scroll);
+    frame.render_widget(paragraph.scroll((effective_scroll, 0)), area);
+    if content_rows > viewport && viewport > 0 {
+        let mut state = ScrollbarState::new(content_rows as usize)
+            .viewport_content_length(viewport as usize)
+            .position(effective_scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            area,
+            &mut state,
+        );
+    }
+}
+
+/// Render `lines` inside a bordered block with title and scrollbar.
+fn render_scrollable_block(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    focused: bool,
+    theme: &Theme,
+) {
+    let block = Block::bordered()
+        .title(title.to_string())
+        .border_style(theme.border(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_scrollable_paragraph(frame, inner, lines, scroll, theme);
+}
+
+/// Append a titled list of items with a ♥ marker for favorites. Skips the
+/// section entirely when there's nothing to show.
+fn push_section(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    items: &[Item],
+    theme: &Theme,
+) {
+    if items.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(title.to_string(), theme.header())));
+    for item in items {
+        let marker = if item.is_favorite { "♥ " } else { "  " };
+        lines.push(Line::from(format!("{marker}{}", item.name)));
+    }
+    lines.push(Line::from(""));
 }
 
 pub fn render_bottom(
@@ -45,6 +229,7 @@ pub fn render_bottom(
     upcoming: &[Item],
     repeat_mode: RepeatMode,
     shuffle: bool,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
@@ -57,11 +242,12 @@ pub fn render_bottom(
             upcoming,
             repeat_mode,
             shuffle,
+            scroll,
             focused,
             theme,
         ),
-        Some("movies") => render_credits(frame, area, detail, focused, theme),
-        Some("tvshows") => render_tv_seasons(frame, area, detail, focused, theme),
+        Some("movies") => render_credits(frame, area, detail, scroll, focused, theme),
+        Some("tvshows") => render_tv_seasons(frame, area, detail, scroll, focused, theme),
         _ => render_placeholder(frame, area, " More ", "", focused, theme),
     }
 }
@@ -77,11 +263,14 @@ fn render_lyrics(
     let block = Block::bordered()
         .title(" Lyrics ")
         .border_style(theme.border(focused));
-    let inner_height = block.inner(area).height as usize;
-    let lines: Vec<Line> = match detail.and_then(|d| d.lyrics.as_deref()) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line<'static>> = match detail.and_then(|d| d.lyrics.as_deref()) {
         Some(lyrics) if !lyrics.is_empty() => render_lyric_lines(lyrics, position, theme),
         Some(_) => vec![Line::from("No lyrics for this track.")],
-        None => vec![Line::from("Select a track to view lyrics.")],
+        None => vec![Line::from(
+            "No lyrics loaded. Press p → Show lyrics to fetch.",
+        )],
     };
     // Auto-scroll so the active line stays roughly centered within the pane.
     let active = detail
@@ -89,15 +278,8 @@ fn render_lyrics(
         .filter(|l| !l.is_empty())
         .zip(position)
         .and_then(|(l, p)| active_lyric_index(l, p));
-    let scroll = scroll_offset(active, lines.len(), inner_height);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme.list_item())
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
-            .block(block),
-        area,
-    );
+    let scroll = scroll_offset(active, lines.len(), inner.height as usize);
+    render_scrollable_paragraph(frame, inner, lines, scroll, theme);
 }
 
 /// Pick a vertical scroll offset so the active line sits near the middle of the
@@ -157,13 +339,11 @@ fn render_cast(
     frame: &mut Frame,
     area: Rect,
     detail: Option<&ItemDetail>,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
-    let block = Block::bordered()
-        .title(" Cast ")
-        .border_style(theme.border(focused));
-    let lines: Vec<Line> = match detail.map(|d| d.cast.as_slice()) {
+    let lines: Vec<Line<'static>> = match detail.map(|d| d.cast.as_slice()) {
         Some(cast) if !cast.is_empty() => cast
             .iter()
             .filter(|p| p.kind.as_deref().is_none_or(is_cast_kind))
@@ -172,23 +352,18 @@ fn render_cast(
         Some(_) => vec![Line::from("No cast listed.")],
         None => vec![Line::from("Select an item to load cast.")],
     };
-    frame.render_widget(
-        Paragraph::new(lines).style(theme.list_item()).wrap(Wrap { trim: true }).block(block),
-        area,
-    );
+    render_scrollable_block(frame, area, " Cast ", lines, scroll, focused, theme);
 }
 
 fn render_credits(
     frame: &mut Frame,
     area: Rect,
     detail: Option<&ItemDetail>,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
-    let block = Block::bordered()
-        .title(" Credits ")
-        .border_style(theme.border(focused));
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(detail) = detail {
         if !detail.genres.is_empty() {
             lines.push(Line::from(format!("Genres: {}", detail.genres.join(", "))));
@@ -203,10 +378,7 @@ fn render_credits(
     if lines.is_empty() {
         lines.push(Line::from("No credits loaded."));
     }
-    frame.render_widget(
-        Paragraph::new(lines).style(theme.list_item()).wrap(Wrap { trim: true }).block(block),
-        area,
-    );
+    render_scrollable_block(frame, area, " Credits ", lines, scroll, focused, theme);
 }
 
 /// TV context, top pane. For a Series this is the list of seasons; for a
@@ -215,11 +387,12 @@ fn render_tv_episodes(
     frame: &mut Frame,
     area: Rect,
     detail: Option<&ItemDetail>,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
     let (title, items, fallback) = pick_tv_top(detail);
-    render_item_list(frame, area, title, items, fallback, focused, theme);
+    render_item_list(frame, area, title, items, fallback, scroll, focused, theme);
 }
 
 /// TV context, bottom pane. Crude pairing of "what's next to this": for an
@@ -229,11 +402,12 @@ fn render_tv_seasons(
     frame: &mut Frame,
     area: Rect,
     detail: Option<&ItemDetail>,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
     let (title, items, fallback) = pick_tv_bottom(detail);
-    render_item_list(frame, area, title, items, fallback, focused, theme);
+    render_item_list(frame, area, title, items, fallback, scroll, focused, theme);
 }
 
 fn pick_tv_top(detail: Option<&ItemDetail>) -> (&'static str, Vec<&Item>, &'static str) {
@@ -273,13 +447,11 @@ fn render_item_list(
     title: &str,
     items: Vec<&Item>,
     fallback: &str,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
-    let block = Block::bordered()
-        .title(title.to_string())
-        .border_style(theme.border(focused));
-    let lines: Vec<Line> = if items.is_empty() {
+    let lines: Vec<Line<'static>> = if items.is_empty() {
         vec![Line::from(fallback.to_string())]
     } else {
         items
@@ -287,10 +459,7 @@ fn render_item_list(
             .map(|item| Line::from(item.name.clone()))
             .collect()
     };
-    frame.render_widget(
-        Paragraph::new(lines).style(theme.list_item()).wrap(Wrap { trim: true }).block(block),
-        area,
-    );
+    render_scrollable_block(frame, area, title, lines, scroll, focused, theme);
 }
 
 /// Music queue: current track from the queue state, then up to a screenful of
@@ -304,14 +473,12 @@ fn render_queue(
     upcoming: &[Item],
     repeat_mode: RepeatMode,
     shuffle: bool,
+    scroll: u16,
     focused: bool,
     theme: &Theme,
 ) {
     let title = queue_title(repeat_mode, shuffle);
-    let block = Block::bordered()
-        .title(title)
-        .border_style(theme.border(focused));
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let current_name: Option<String> = current_track
         .map(|t| t.name.clone())
         .or_else(|| now_playing.map(|np| np.title.clone()));
@@ -333,7 +500,7 @@ fn render_queue(
         }
         None => lines.push(Line::from(Span::styled("Queue is empty.", theme.muted()))),
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    render_scrollable_block(frame, area, &title, lines, scroll, focused, theme);
 }
 
 /// Build the queue block title, surfacing any non-default modes so the user

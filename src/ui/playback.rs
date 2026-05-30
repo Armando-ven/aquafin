@@ -133,7 +133,8 @@ impl Playback {
             | Intent::SaveVolume(_)
             | Intent::SaveSectionMemory(_)
             | Intent::SaveLastLibrary(_)
-            | Intent::SaveSearchHistory(_) => {}
+            | Intent::SaveSearchHistory(_)
+            | Intent::LoadCurrentDetail { .. } => {}
         }
     }
 
@@ -329,6 +330,12 @@ impl Playback {
             app.show_error("No audio output device is available.");
             return;
         }
+        // Auto-fetch detail (lyrics included) for the now-playing track so the
+        // lyrics pane populates without the user having to open the menu.
+        app.queue_intent(Intent::LoadCurrentDetail {
+            item_id: item.id.clone(),
+            kind: item.kind.clone(),
+        });
         let client = self.client.clone();
         let tx = self.fetch_tx.clone();
         let id = item.id.clone();
@@ -499,6 +506,37 @@ mod tests {
         assert_eq!(ticks_to_duration(-5), None);
         // 1 second == 10,000,000 ticks.
         assert_eq!(ticks_to_duration(10_000_000), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn audio_playback_auto_queues_load_current_detail() {
+        // Starting audio playback should queue a LoadCurrentDetail intent so
+        // lyrics auto-populate without the user opening the popup menu.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = JellyfinClient::new("http://localhost", "tok", "u1", "dev").unwrap();
+        let audio = AudioEngine::new(50);
+        let mut playback = Playback::new(runtime.handle().clone(), client, audio, 5);
+
+        let mut app = App::with_libraries(vec![crate::ui::app::Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![Item {
+                id: "track-1".to_string(),
+                name: "A Track".to_string(),
+                kind: Some("Audio".to_string()),
+                ..Default::default()
+            }],
+        }]);
+        let item = app.current_item().cloned().unwrap();
+        playback.dispatch(Intent::Play { item, media: MediaKind::Audio }, &mut app);
+        assert!(app.take_intents().iter().any(|i| matches!(
+            i,
+            Intent::LoadCurrentDetail { item_id, .. } if item_id == "track-1"
+        )));
     }
 
     #[test]
