@@ -517,6 +517,15 @@ pub struct Level {
     pub selected: usize,
     /// Children are still being fetched.
     pub loading: bool,
+    /// The item the user drilled into to open this level (the album, artist,
+    /// series, …). Used so the info pane can render the parent while the
+    /// children are still loading. `None` for the library root.
+    pub parent_item: Option<Item>,
+    /// `false` on a freshly drilled level: the user hasn't moved the cursor
+    /// yet, so the info pane should stay on `parent_item` even after the
+    /// children have loaded. The first Up/Down/Top/Bottom flips this to
+    /// `true` so subsequent renders follow the selected child.
+    pub cursor_engaged: bool,
 }
 
 impl Level {
@@ -528,6 +537,8 @@ impl Level {
             items,
             selected: 0,
             loading: false,
+            parent_item: None,
+            cursor_engaged: true,
         }
     }
 }
@@ -826,9 +837,32 @@ impl App {
         }
     }
 
+    /// Item the user is currently engaging with: the focused row in whichever
+    /// pane holds focus. When focus is on the items list (top-left), this is
+    /// the library root selection — so drilling into a Series leaves
+    /// `current_item` on the Series itself, and the info pane keeps rendering
+    /// it. When focus is on the Content pane, this walks into the drilled
+    /// level instead — falling back to the level's `parent_item` while its
+    /// children are still loading so the info pane never goes blank.
     pub fn current_item(&self) -> Option<&Item> {
-        self.current_level()
-            .and_then(|level| level.items.get(level.selected))
+        let level = match self.focus {
+            Pane::LibraryItems => self.root_level(),
+            _ => self.current_level(),
+        };
+        let level = level?;
+        // Until the user moves the cursor in this drilled level, the info pane
+        // stays pinned on the drilled-into parent. Otherwise the parent's
+        // detail would flash for a moment and then get replaced by the first
+        // child's detail as soon as the children load.
+        if !level.cursor_engaged {
+            if let Some(parent) = level.parent_item.as_ref() {
+                return Some(parent);
+            }
+        }
+        level
+            .items
+            .get(level.selected)
+            .or(level.parent_item.as_ref())
     }
 
     /// Breadcrumb of the current drill path within the library (e.g.
@@ -900,6 +934,16 @@ impl App {
         {
             self.current_detail = Some((item_id.to_string(), detail));
         }
+    }
+
+    /// Reset the per-selection transient state (scroll offsets, the open
+    /// media-options view) without dropping cached detail. Called by the run
+    /// loop when the user moves to a different item, so the info pane keeps
+    /// its content but the right pane scrolls back to the top.
+    pub fn reset_context_scroll_for_selection_change(&mut self) {
+        self.context_top_scroll = 0;
+        self.context_bottom_scroll = 0;
+        self.media_options_view = None;
     }
 
     /// Drop any cached detail (called when the selection changes so the
@@ -1141,6 +1185,8 @@ impl App {
             items: Vec::new(),
             selected: 0,
             loading: true,
+            parent_item: None,
+            cursor_engaged: true,
         }];
         // Fetch first (the primary action), then queue the save so the choice
         // survives restart.
@@ -1466,6 +1512,8 @@ impl App {
             items: Vec::new(),
             selected: 0,
             loading: true,
+            parent_item: None,
+            cursor_engaged: true,
         }];
         self.pending.push(Intent::Search { query });
     }
@@ -2193,6 +2241,8 @@ impl App {
             items: Vec::new(),
             selected: 0,
             loading: true,
+            parent_item: Some(item.clone()),
+            cursor_engaged: false,
         });
         let collection = self
             .current_library()
@@ -2268,6 +2318,7 @@ impl App {
             Pane::Content => {
                 if self.is_drilled() {
                     if let Some(level) = self.stack.last_mut() {
+                        level.cursor_engaged = true;
                         if level.selected + 1 < level.items.len() {
                             level.selected += 1;
                         }
@@ -2296,6 +2347,7 @@ impl App {
             Pane::Content => {
                 if self.is_drilled() {
                     if let Some(level) = self.stack.last_mut() {
+                        level.cursor_engaged = true;
                         level.selected = level.selected.saturating_sub(1);
                     }
                 }
@@ -2319,6 +2371,7 @@ impl App {
             Pane::Content => {
                 if self.is_drilled() {
                     if let Some(level) = self.stack.last_mut() {
+                        level.cursor_engaged = true;
                         level.selected = 0;
                     }
                 }
@@ -2338,6 +2391,7 @@ impl App {
             Pane::Content => {
                 if self.is_drilled() {
                     if let Some(level) = self.stack.last_mut() {
+                        level.cursor_engaged = true;
                         level.selected = level.items.len().saturating_sub(1);
                     }
                 }
@@ -2445,13 +2499,36 @@ pub(crate) fn run_browser(
         if current_id == last_item_id {
             stable_ticks = stable_ticks.saturating_add(1);
         } else {
-            // Selection moved — drop any cached detail so the renderer doesn't
-            // show last item's lyrics/cast.
-            app.clear_current_detail();
+            // Selection moved — keep the previously-cached detail in memory
+            // so the info pane doesn't blank between hovers. The cache is
+            // keyed by item id, so the renderer naturally falls back to "no
+            // detail yet" until the new item's fetch lands; old detail will
+            // never be rendered for the new item. We also auto-reveal the new
+            // item so the info pane stays drawn instead of dropping back to
+            // its placeholder.
+            if let Some(id) = current_id.as_deref() {
+                app.reveal_item(id.to_string());
+            }
+            // Selection-specific transient state that shouldn't follow the
+            // user to a new item: scroll offsets, the media-options view.
+            // Cached detail itself is intentionally kept — the renderer
+            // filters by id so old data never bleeds into the new selection.
+            app.reset_context_scroll_for_selection_change();
             stable_ticks = 0;
             last_item_id = current_id.clone();
         }
         let gate_open = stable_ticks >= STABLE_TICKS;
+
+        // Once the selection has been stable for a few ticks, auto-fetch its
+        // detail so navigating the list keeps the info pane up-to-date
+        // without a manual `p → Load info` step. The `Details` fetcher
+        // dedupes per item id, so this won't spam the server.
+        if gate_open {
+            if let (Some(item), Some(dt)) = (app.current_item().cloned(), details.as_deref_mut())
+            {
+                dt.request(&item.id, item.kind.as_deref());
+            }
+        }
 
         let revealed = app.current_item_revealed();
         if let Some(im) = images.as_deref_mut() {
@@ -3139,7 +3216,10 @@ mod tests {
             id: format!("id-{name}"),
             name: name.to_string(),
             kind: Some(kind.to_string()),
-            is_folder: kind == "Series" || kind == "Season" || kind == "MusicAlbum",
+            is_folder: matches!(
+                kind,
+                "Series" | "Season" | "MusicAlbum" | "MusicArtist" | "Playlist"
+            ),
             ..Default::default()
         }
     }
@@ -3313,6 +3393,85 @@ mod tests {
         app.handle_key(press(KeyCode::Backspace));
         assert!(!app.is_drilled());
         assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Thing"));
+    }
+
+    #[test]
+    #[test]
+    fn enter_on_artist_in_music_library_keeps_current_item_on_artist() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Daft Punk", "MusicArtist")],
+        }]);
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.is_drilled());
+        // Music does shift focus to Content, but the empty loading level
+        // exposes its `parent_item`, so the info pane keeps rendering Daft
+        // Punk until the artist's albums load.
+        assert_eq!(app.focus, Pane::Content);
+        assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Daft Punk"));
+        assert!(app.current_item_revealed());
+    }
+
+    #[test]
+    fn drilled_level_stays_on_parent_until_cursor_moves() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Discovery", "MusicAlbum")],
+        }]);
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        // Loader fills the drilled level with tracks.
+        let parent_id = app.current_level().unwrap().parent_id.clone();
+        app.fill_level(
+            &parent_id,
+            vec![
+                Item { id: "t1".to_string(), name: "Track 1".to_string(), kind: Some("Audio".to_string()), ..Default::default() },
+                Item { id: "t2".to_string(), name: "Track 2".to_string(), kind: Some("Audio".to_string()), ..Default::default() },
+            ],
+        );
+        // Before any cursor move, the info pane stays pinned on Discovery.
+        assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Discovery"));
+        // A single Down flips cursor_engaged + moves the info pane onto the
+        // first track.
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Track 2"));
+    }
+
+    #[test]
+    fn enter_on_album_keeps_current_item_on_album_until_tracks_load() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Discovery", "MusicAlbum")],
+        }]);
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.is_drilled());
+        assert_eq!(app.focus, Pane::Content);
+        assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Discovery"));
+        assert!(app.current_item_revealed());
+    }
+
+    #[test]
+    fn enter_on_series_keeps_focus_and_current_item_on_series() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "tv".to_string(),
+            name: "TV".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            items: vec![typed_item("Severance", "Series")],
+        }]);
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.is_drilled());
+        assert_eq!(app.focus, Pane::LibraryItems);
+        // current_item still points at the Series (root level), so the info
+        // pane keeps rendering Severance instead of a (loading) child level.
+        assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Severance"));
+        // Auto-revealed by drill_into so the info pane actually draws.
+        assert!(app.current_item_revealed());
     }
 
     #[test]
