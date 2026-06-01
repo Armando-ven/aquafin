@@ -11,7 +11,10 @@ use tokio::runtime::Handle;
 use crate::api::models::ItemsQuery;
 use crate::api::JellyfinClient;
 
-use super::app::{App, Item, Section};
+use super::app::{
+    App, Intent, Item, Library, MediaKind, MediaVersion, Section, TrackPickerEntry, VideoTrackKind,
+};
+use crate::video::TrackChoice;
 
 /// Result of an async fetch, tagged so the UI knows which level to fill.
 enum BrowseResult {
@@ -33,6 +36,30 @@ enum BrowseResult {
         id: String,
         message: String,
     },
+    /// Outcome of a `SyncLibraries` request: the refreshed (already-filtered)
+    /// library list.
+    Libraries(Vec<Library>),
+    /// Server-side library list for the visible-libraries picker; each entry
+    /// is (id, name, currently-visible?).
+    LibraryMeta(Vec<(String, String, bool)>),
+    /// The user's playlists, fetched for the playlist picker.
+    Playlists(Vec<(String, String)>),
+    /// Mix tracks fetched for `Intent::InstantMix`. The controller queues them
+    /// and starts playback of the first track.
+    InstantMix(Vec<Item>),
+    /// Audio / subtitle tracks for the open video track picker.
+    VideoTracks(Vec<TrackPickerEntry>),
+    /// Versions + audio + subtitle entries for the media-options view.
+    MediaOptions {
+        item_id: String,
+        versions: Vec<MediaVersion>,
+        audio_entries: Vec<TrackPickerEntry>,
+        subtitle_entries: Vec<TrackPickerEntry>,
+    },
+    /// Server action finished — show this as a status-bar note.
+    Status(String),
+    /// Server action failed — surface via the error modal.
+    Error(String),
 }
 
 pub struct Browser {
@@ -130,6 +157,196 @@ impl Browser {
         });
     }
 
+    /// Re-fetch every library + its top-level items. Used by the
+    /// "Sync with server now" client-menu action.
+    pub fn sync_libraries(&mut self, visible: Option<Vec<String>>) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match fetch_libraries(&client, visible.as_deref()).await {
+                Ok(libraries) => BrowseResult::Libraries(libraries),
+                Err(e) => BrowseResult::Error(format!("Sync failed: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Fetch the full server-side library list (including currently-hidden
+    /// ones) for the visible-libraries picker. Each entry is tagged with its
+    /// current visibility based on the `visible` list (None = all visible).
+    pub fn load_library_meta(&mut self, visible: Option<Vec<String>>) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.user_views().await {
+                Ok(views) => {
+                    let entries = views
+                        .into_iter()
+                        .map(|v| {
+                            let name = v.name.unwrap_or_else(|| "(library)".to_string());
+                            let on = match &visible {
+                                None => true,
+                                Some(list) => list.iter().any(|id| id == &v.id),
+                            };
+                            (v.id, name, on)
+                        })
+                        .collect();
+                    BrowseResult::LibraryMeta(entries)
+                }
+                Err(e) => BrowseResult::Error(format!("Couldn't fetch libraries: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Fetch the user's playlists for the Add-to-playlist picker.
+    pub fn load_playlists(&mut self) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let query = ItemsQuery {
+                include_item_types: vec!["Playlist".to_string()],
+                recursive: Some(true),
+                sort_by: vec!["SortName".to_string()],
+                limit: Some(500),
+                ..Default::default()
+            };
+            let result = match client.items(&query).await {
+                Ok(list) => BrowseResult::Playlists(
+                    list.items
+                        .into_iter()
+                        .map(|dto| (dto.id, dto.name.unwrap_or_else(|| "(playlist)".to_string())))
+                        .collect(),
+                ),
+                Err(e) => BrowseResult::Error(format!("Couldn't fetch playlists: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// `POST /Playlists/{playlistId}/Items` — append one item.
+    pub fn add_to_playlist(&mut self, playlist_id: String, item_id: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.add_to_playlist(&playlist_id, &[item_id.as_str()]).await {
+                Ok(()) => BrowseResult::Status("Added to playlist".to_string()),
+                Err(e) => BrowseResult::Error(format!("Add to playlist failed: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Fetch the Instant Mix queue for `item`.
+    pub fn instant_mix(&mut self, item: Item) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.instant_mix(&item.id, 50).await {
+                Ok(list) => {
+                    let items: Vec<Item> = list
+                        .items
+                        .into_iter()
+                        .map(super::item_from_dto)
+                        .filter(|i| matches!(MediaKind::classify(i.kind.as_deref()), MediaKind::Audio))
+                        .collect();
+                    if items.is_empty() {
+                        BrowseResult::Error("Instant mix returned no playable tracks".to_string())
+                    } else {
+                        BrowseResult::InstantMix(items)
+                    }
+                }
+                Err(e) => BrowseResult::Error(format!("Instant mix failed: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Fetch `PlaybackInfo` and populate the media-options view (versions +
+    /// audio + subtitle entries) in a single round-trip.
+    pub fn load_media_options(&mut self, item_id: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.playback_info(&item_id).await {
+                Ok(info) => {
+                    let versions = info
+                        .media_sources
+                        .iter()
+                        .filter_map(|s| {
+                            s.id.clone().map(|id| MediaVersion {
+                                label: format_version_label(s),
+                                source_id: id,
+                            })
+                        })
+                        .collect();
+                    let streams = info
+                        .media_sources
+                        .into_iter()
+                        .next()
+                        .map(|s| s.media_streams)
+                        .unwrap_or_default();
+                    let audio_entries = build_track_entries(&streams, VideoTrackKind::Audio);
+                    let subtitle_entries =
+                        build_track_entries(&streams, VideoTrackKind::Subtitle);
+                    BrowseResult::MediaOptions {
+                        item_id,
+                        versions,
+                        audio_entries,
+                        subtitle_entries,
+                    }
+                }
+                Err(e) => BrowseResult::Error(format!("Couldn't load playback info: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Fetch `PlaybackInfo` and surface the audio or subtitle stream list.
+    pub fn load_video_tracks(&mut self, item_id: String, kind: VideoTrackKind) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.playback_info(&item_id).await {
+                Ok(info) => {
+                    let streams = info
+                        .media_sources
+                        .into_iter()
+                        .next()
+                        .map(|s| s.media_streams)
+                        .unwrap_or_default();
+                    BrowseResult::VideoTracks(build_track_entries(&streams, kind))
+                }
+                Err(e) => BrowseResult::Error(format!("Couldn't load tracks: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Record a dislike (`POST /UserItems/{id}/Rating?likes=false`).
+    pub fn dislike(&mut self, item_id: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = client.set_rating(&item_id, false).await {
+                let _ = tx.send(BrowseResult::Error(format!("Dislike failed: {e}")));
+            }
+        });
+    }
+
+    /// Build the web URL for `item_id` and copy it to the system clipboard via
+    /// OSC 52. The result feeds back through the regular channel so the status
+    /// bar updates in the next tick.
+    pub fn copy_item_url(&self, item_id: String, item_name: String) {
+        let url = self.client.item_web_url(&item_id);
+        let result = if super::error_modal::copy_to_clipboard(&url) {
+            BrowseResult::Status(format!("Copied URL: {item_name}"))
+        } else {
+            BrowseResult::Error("Couldn't write OSC 52 clipboard sequence".to_string())
+        };
+        let _ = self.tx.send(result);
+    }
+
     /// Deliver any completed fetches into the app's drill stack.
     pub fn tick(&mut self, app: &mut App) {
         while let Ok(result) = self.rx.try_recv() {
@@ -149,10 +366,175 @@ impl Browser {
                     app.drop_loading_level(&id);
                     app.show_error(message);
                 }
+                BrowseResult::Libraries(libraries) => app.replace_libraries(libraries),
+                BrowseResult::LibraryMeta(entries) => app.set_library_picker_entries(entries),
+                BrowseResult::Playlists(entries) => app.set_playlist_picker_entries(entries),
+                BrowseResult::VideoTracks(entries) => app.set_video_track_picker_entries(entries),
+                BrowseResult::MediaOptions {
+                    item_id,
+                    versions,
+                    audio_entries,
+                    subtitle_entries,
+                } => app.set_media_options_view_data(
+                    &item_id,
+                    versions,
+                    audio_entries,
+                    subtitle_entries,
+                ),
+                BrowseResult::InstantMix(items) => {
+                    let first = items[0].clone();
+                    app.set_play_queue(items, 0);
+                    app.queue_intent(Intent::PlayQueueCurrent { item: first });
+                }
+                BrowseResult::Status(message) => app.set_status(message),
+                BrowseResult::Error(message) => app.show_error(message),
             }
         }
     }
+
+    /// Borrow the underlying [`JellyfinClient`] for callers that need to read
+    /// the configured base URL (e.g. building the visible-library list before a
+    /// sync).
+    pub fn client(&self) -> &JellyfinClient {
+        &self.client
+    }
 }
+
+/// Compose a one-line label for a `MediaSource` (used by the version list).
+fn format_version_label(source: &crate::api::models::MediaSource) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = source.name.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(name.to_string());
+    }
+    if let Some(container) = source.container.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(container.to_uppercase());
+    }
+    let video = source
+        .media_streams
+        .iter()
+        .find(|s| s.type_.as_deref() == Some("Video"));
+    if let Some(stream) = video {
+        if let Some(codec) = stream.codec.as_deref().filter(|s| !s.is_empty()) {
+            parts.push(codec.to_string());
+        }
+    }
+    if let Some(size) = source.size {
+        parts.push(format_size(size));
+    }
+    if parts.is_empty() {
+        parts.push("Default".to_string());
+    }
+    parts.join("  ·  ")
+}
+
+fn format_size(bytes: i64) -> String {
+    let b = bytes as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} GiB", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.0} MiB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Walk the source's stream list, build a picker entry list for `kind`.
+/// `Auto` is always first; `Off` is included for subtitles. mpv's per-type
+/// 1-based index is derived here so the caller can ignore Jellyfin's absolute
+/// indices.
+pub(crate) fn build_track_entries(
+    streams: &[crate::api::models::MediaStream],
+    kind: VideoTrackKind,
+) -> Vec<TrackPickerEntry> {
+    let wanted = match kind {
+        VideoTrackKind::Audio => "Audio",
+        VideoTrackKind::Subtitle => "Subtitle",
+    };
+    let mut entries: Vec<TrackPickerEntry> = Vec::new();
+    entries.push(TrackPickerEntry {
+        label: "Auto (server default)".to_string(),
+        choice: TrackChoice::Auto,
+    });
+    if matches!(kind, VideoTrackKind::Subtitle) {
+        entries.push(TrackPickerEntry {
+            label: "Off".to_string(),
+            choice: TrackChoice::Off,
+        });
+    }
+    let mut counter = 0i32;
+    for stream in streams {
+        if stream.type_.as_deref() != Some(wanted) {
+            continue;
+        }
+        counter += 1;
+        entries.push(TrackPickerEntry {
+            label: format_track_label(stream, counter),
+            choice: TrackChoice::Pick(counter),
+        });
+    }
+    entries
+}
+
+/// Compose a one-line description of `stream`, falling back to whatever
+/// fields the server provides.
+fn format_track_label(stream: &crate::api::models::MediaStream, mpv_index: i32) -> String {
+    if let Some(display) = stream.display_title.as_deref().filter(|s| !s.is_empty()) {
+        let mut s = format!("#{mpv_index}  {display}");
+        if stream.is_default.unwrap_or(false) {
+            s.push_str("  (default)");
+        }
+        if stream.is_forced.unwrap_or(false) {
+            s.push_str("  (forced)");
+        }
+        return s;
+    }
+    let mut parts: Vec<String> = vec![format!("#{mpv_index}")];
+    if let Some(lang) = stream.language.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(lang.to_string());
+    }
+    if let Some(title) = stream.title.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(title.to_string());
+    }
+    if let Some(codec) = stream.codec.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(codec.to_string());
+    }
+    if let Some(layout) = stream.channel_layout.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(layout.to_string());
+    }
+    if parts.len() == 1 {
+        parts.push("Unnamed track".to_string());
+    }
+    parts.join("  ·  ")
+}
+
+/// Fetch all libraries + their top-level items, applying the visibility
+/// ordering. Shared between the startup load and the runtime sync.
+pub(crate) async fn fetch_libraries(
+    client: &JellyfinClient,
+    visible: Option<&[String]>,
+) -> crate::api::Result<Vec<Library>> {
+    let views = client.user_views().await?;
+    let ordered = super::order_views(views, visible);
+    let mut libraries = Vec::with_capacity(ordered.len());
+    for view in ordered {
+        let result = client
+            .items(&ItemsQuery {
+                parent_id: Some(view.id.clone()),
+                limit: Some(200),
+                fields: vec!["Overview".to_string()],
+                ..Default::default()
+            })
+            .await?;
+        libraries.push(Library {
+            id: view.id,
+            name: view.name.unwrap_or_else(|| "(library)".to_string()),
+            collection_type: view.collection_type,
+            items: result.items.into_iter().map(super::item_from_dto).collect(),
+        });
+    }
+    Ok(libraries)
+}
+
 
 /// Build the items-query for a section filter and return the converted UI
 /// [`Item`]s. Extracted so the network call can be exercised under wiremock
@@ -258,6 +640,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(items[0].name, "Root");
+    }
+
+    #[test]
+    fn build_track_entries_lists_audio_with_per_type_index() {
+        use crate::api::models::MediaStream;
+        let streams = vec![
+            MediaStream {
+                type_: Some("Video".to_string()),
+                index: 0,
+                ..Default::default()
+            },
+            MediaStream {
+                type_: Some("Audio".to_string()),
+                index: 1,
+                language: Some("eng".to_string()),
+                channel_layout: Some("5.1".to_string()),
+                is_default: Some(true),
+                ..Default::default()
+            },
+            MediaStream {
+                type_: Some("Audio".to_string()),
+                index: 2,
+                language: Some("jpn".to_string()),
+                ..Default::default()
+            },
+            MediaStream {
+                type_: Some("Subtitle".to_string()),
+                index: 3,
+                language: Some("eng".to_string()),
+                ..Default::default()
+            },
+        ];
+        let audio = build_track_entries(&streams, VideoTrackKind::Audio);
+        assert!(matches!(audio[0].choice, TrackChoice::Auto));
+        assert!(matches!(audio[1].choice, TrackChoice::Pick(1)));
+        assert!(matches!(audio[2].choice, TrackChoice::Pick(2)));
+        assert_eq!(audio.len(), 3, "no Off for audio");
+
+        let subs = build_track_entries(&streams, VideoTrackKind::Subtitle);
+        assert!(matches!(subs[0].choice, TrackChoice::Auto));
+        assert!(matches!(subs[1].choice, TrackChoice::Off));
+        assert!(matches!(subs[2].choice, TrackChoice::Pick(1)));
+        assert_eq!(subs.len(), 3);
     }
 
     #[test]

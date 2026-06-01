@@ -17,6 +17,7 @@ use ratatui::{Frame, Terminal};
 use super::keymap::{Action, Keymap};
 use super::{cheatsheet, error_modal, layout, panes, popup_menu, theme_picker};
 use crate::theme::Theme;
+use crate::video::{TrackChoice, VideoOptions};
 
 pub(crate) type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -118,6 +119,37 @@ pub enum Intent {
     /// Manually fetch detail (cast, lyrics, children, siblings) for the named
     /// item. Triggered by the item-options popup; no longer auto-fetched.
     LoadCurrentDetail { item_id: String, kind: Option<String> },
+    /// Re-fetch libraries + their top-level items from the server.
+    SyncLibraries,
+    /// Fetch every library the server exposes (not just the visible subset) so
+    /// the visible-library picker can render its checklist.
+    LoadAllLibraryMeta,
+    /// Persist the chosen visible-library set + re-sync.
+    SaveVisibleLibraries(Vec<String>),
+    /// Fetch the user's playlists for the playlist picker; `target_item_id`
+    /// rides along so the result knows which item the user wants to add.
+    LoadPlaylists { target_item_id: String },
+    /// Append `item_id` to `playlist_id`.
+    AddToPlaylist { playlist_id: String, item_id: String },
+    /// Replace the queue with an Instant Mix seeded from `item` and play it.
+    InstantMix { item: Item },
+    /// Record a dislike (`POST /UserItems/{id}/Rating?likes=false`).
+    Dislike { item_id: String },
+    /// Resolve `item_id` to its web URL and copy it to the system clipboard.
+    /// `item_name` is shown in the status message.
+    CopyItemUrl { item_id: String, item_name: String },
+    /// Play `item`, which is already at `app.queue_index` in `app.queue` —
+    /// used by Instant Mix so the controller doesn't rebuild the queue from
+    /// the active level.
+    PlayQueueCurrent { item: Item },
+    /// Fetch audio + subtitle stream lists for the video item, then populate
+    /// the matching picker overlay.
+    LoadVideoTracks { item_id: String, kind: VideoTrackKind },
+    /// Fetch versions + audio + subtitle streams for the media-options view
+    /// (pre-play config rendered in the content pane).
+    LoadMediaOptions { item_id: String },
+    /// Launch mpv on an external trailer URL.
+    WatchTrailer { url: String, title: String },
 }
 
 /// Which popup menu, if any, is open.
@@ -129,7 +161,7 @@ pub enum PopupMenu {
     Client(usize),
 }
 
-/// Entries in the per-item options popup. The popup is built dynamically per
+/// Entries in the per-item actions popup. The popup is built dynamically per
 /// item so audio-only / folder-only actions stay out of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemMenuAction {
@@ -137,6 +169,95 @@ pub enum ItemMenuAction {
     ShowLyrics,
     Play,
     ToggleFavorite,
+    AddToPlaylist,
+    InstantMix,
+    Dislike,
+    ToggleShuffle,
+    CycleRepeat,
+    AudioTrack,
+    Subtitles,
+    CopyUrl,
+}
+
+/// Which video track stream the picker is listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoTrackKind {
+    Audio,
+    Subtitle,
+}
+
+/// One entry shown in the video track picker.
+#[derive(Debug, Clone)]
+pub struct TrackPickerEntry {
+    pub label: String,
+    pub choice: TrackChoice,
+}
+
+/// State for the video audio / subtitle picker overlay.
+#[derive(Debug, Clone)]
+pub struct VideoTrackPickerState {
+    pub item_id: String,
+    pub item_name: String,
+    pub kind: VideoTrackKind,
+    pub entries: Option<Vec<TrackPickerEntry>>,
+    pub selected: usize,
+}
+
+/// Per-item audio + subtitle selection persisted across play presses.
+#[derive(Debug, Clone)]
+pub struct VideoTrackSelection {
+    pub audio: TrackChoice,
+    pub subtitle: TrackChoice,
+    /// Jellyfin `MediaSourceId` (`None` ⇒ default = item id).
+    pub media_source_id: Option<String>,
+}
+
+impl Default for VideoTrackSelection {
+    fn default() -> Self {
+        Self {
+            audio: TrackChoice::Auto,
+            subtitle: TrackChoice::Auto,
+            media_source_id: None,
+        }
+    }
+}
+
+/// One playable version exposed by Jellyfin (multiple per item for files like
+/// `Movie (1080p)` + `Movie (4K)`).
+#[derive(Debug, Clone)]
+pub struct MediaVersion {
+    pub source_id: String,
+    pub label: String,
+}
+
+/// Cursor position inside the media-options view, used so Enter on the right
+/// row commits the right selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaOptionsCursor {
+    Version(usize),
+    Audio(usize),
+    Subtitle(usize),
+    Play,
+    WatchTrailer,
+}
+
+/// State for the content-pane media-options view (versions + audio + subs +
+/// Play). Populated by `Intent::LoadMediaOptions`.
+#[derive(Debug, Clone)]
+pub struct MediaOptionsViewState {
+    pub item_id: String,
+    pub item_name: String,
+    pub loading: bool,
+    pub versions: Vec<MediaVersion>,
+    pub audio_entries: Vec<TrackPickerEntry>,
+    pub subtitle_entries: Vec<TrackPickerEntry>,
+    pub selected_version: usize,
+    pub selected_audio: usize,
+    pub selected_subtitle: usize,
+    pub cursor: MediaOptionsCursor,
+    /// External trailer URLs (mirrored from `ItemDetail.trailer_urls` once the
+    /// detail fetch lands). Watch trailer row is shown when non-empty.
+    pub trailer_urls: Vec<String>,
 }
 
 /// Which view the music top-right context pane is rendering.
@@ -152,9 +273,29 @@ pub enum ContextTopView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientMenuAction {
     Themes,
-    ToggleShuffle,
-    CycleRepeat,
+    SyncNow,
+    VisibleLibraries,
     Quit,
+}
+
+/// State for the visible-library picker overlay. `entries` is the full set of
+/// libraries exposed by the server (each tagged with its current visibility);
+/// the user toggles entries with Space and confirms with Enter.
+#[derive(Debug, Clone)]
+pub struct LibraryPickerState {
+    pub entries: Vec<(String, String, bool)>,
+    pub selected: usize,
+    pub loading: bool,
+}
+
+/// State for the playlist picker overlay (item-options → Add to playlist).
+/// `entries = None` while the async fetch is in flight.
+#[derive(Debug, Clone)]
+pub struct PlaylistPickerState {
+    pub target_item_id: String,
+    pub target_item_name: String,
+    pub entries: Option<Vec<(String, String)>>,
+    pub selected: usize,
 }
 
 /// Display-only snapshot of the active playback, written by the event loop each
@@ -307,6 +448,8 @@ pub struct ItemDetail {
     pub artist_albums: Vec<Item>,
     /// Albums the artist contributes to but isn't the primary album-artist of.
     pub appears_on: Vec<Item>,
+    /// External trailer URLs (YouTube etc.) for the item.
+    pub trailer_urls: Vec<String>,
 }
 
 /// In-place Fisher-Yates shuffle backed by a tiny linear-congruential PRNG
@@ -455,6 +598,20 @@ pub struct App {
     theme_picker: Option<usize>,
     /// Currently-open popup menu (item options or client settings), if any.
     popup: Option<PopupMenu>,
+    /// True while the user has pressed `g` and the next keystroke should be
+    /// resolved by the go-to menu instead of the normal keymap.
+    awaiting_go_to: bool,
+    /// Visible-library picker overlay (Client settings → Visible libraries…).
+    library_picker: Option<LibraryPickerState>,
+    /// Playlist picker overlay (Item options → Add to playlist).
+    playlist_picker: Option<PlaylistPickerState>,
+    /// Video audio / subtitle track picker overlay.
+    video_track_picker: Option<VideoTrackPickerState>,
+    /// Per-item video track selections; consumed by [`Playback`] on Play.
+    video_track_selections: std::collections::HashMap<String, VideoTrackSelection>,
+    /// Pre-play media-options view rendered in the content pane for video
+    /// items (versions + audio + subtitles + Play).
+    media_options_view: Option<MediaOptionsViewState>,
     /// Id of the item the user has explicitly revealed via the popup's "Load
     /// info" action. While `None`, the middle pane shows a placeholder instead
     /// of cover + title + description. Cleared when selection changes.
@@ -549,6 +706,12 @@ impl App {
             available_themes: Vec::new(),
             theme_picker: None,
             popup: None,
+            awaiting_go_to: false,
+            library_picker: None,
+            playlist_picker: None,
+            video_track_picker: None,
+            video_track_selections: std::collections::HashMap::new(),
+            media_options_view: None,
             revealed_item_id: None,
             context_view: ContextTopView::default(),
             context_top_scroll: 0,
@@ -726,6 +889,11 @@ impl App {
     /// Store fetched detail for `item_id` (ignored if the selection has moved
     /// on since the request was queued).
     pub fn set_current_detail(&mut self, item_id: &str, detail: ItemDetail) {
+        if let Some(view) = self.media_options_view.as_mut() {
+            if view.item_id == item_id {
+                view.trailer_urls = detail.trailer_urls.clone();
+            }
+        }
         if self
             .current_item()
             .is_some_and(|item| item.id == item_id)
@@ -744,6 +912,7 @@ impl App {
         self.context_top_scroll = 0;
         self.context_bottom_scroll = 0;
         self.context_view = ContextTopView::default();
+        self.media_options_view = None;
     }
 
     pub fn context_view(&self) -> ContextTopView {
@@ -795,6 +964,19 @@ impl App {
     /// current list, with the focused item as the starting position. Replaces
     /// any prior queue. The returned tuple is `(queue, starting_index)` so
     /// callers can also feed the first track to the engine.
+    /// Replace the queue wholesale (used by Instant Mix). The caller passes
+    /// the index of the track that should start playing.
+    pub fn set_play_queue(&mut self, items: Vec<Item>, start_index: usize) {
+        if items.is_empty() {
+            self.queue.clear();
+            self.queue_index = None;
+            return;
+        }
+        let index = start_index.min(items.len() - 1);
+        self.queue = items;
+        self.queue_index = Some(index);
+    }
+
     pub fn build_queue_for(&mut self, started: &Item) {
         let Some(level) = self.current_level() else {
             self.queue.clear();
@@ -1017,6 +1199,42 @@ impl App {
             return;
         }
 
+        // The go-to prefix captures the very next key. Esc cancels.
+        if self.awaiting_go_to {
+            self.resolve_go_to(key);
+            return;
+        }
+
+        // Go-to trigger fires from anywhere except the search input (where it
+        // would be eaten as a literal character). Overlays it competes with
+        // are closed when `resolve_go_to` applies a target.
+        if self.search_query.is_none() {
+            if let Some(Action::GoTo) = self.keymap.action_for(key) {
+                self.awaiting_go_to = true;
+                return;
+            }
+        }
+
+        // Pickers (visibility / playlist / video tracks) sit above the popup
+        // menu and capture input until closed.
+        if self.library_picker.is_some() {
+            self.handle_library_picker_key(key);
+            return;
+        }
+        if self.playlist_picker.is_some() {
+            self.handle_playlist_picker_key(key);
+            return;
+        }
+        if self.video_track_picker.is_some() {
+            self.handle_video_track_picker_key(key);
+            return;
+        }
+        // Media-options view captures input while the Content pane is focused.
+        if self.media_options_view.is_some() && self.focus == Pane::Content {
+            self.handle_media_options_key(key);
+            return;
+        }
+
         // Any open popup menu captures input until closed.
         if self.popup.is_some() {
             self.handle_popup_key(key);
@@ -1108,8 +1326,62 @@ impl App {
             Action::InfoScrollUp => self.scroll_focused_context(-3),
             Action::InfoScrollDown => self.scroll_focused_context(3),
             Action::Help => self.show_help = true,
+            Action::GoTo => self.awaiting_go_to = true,
             Action::Cancel => {}
         }
+    }
+
+    /// Resolve the second keystroke of the go-to chord into a focus / view
+    /// change. Esc cancels the chord; any unhandled key just clears the flag.
+    fn resolve_go_to(&mut self, key: KeyEvent) {
+        self.awaiting_go_to = false;
+        // Esc cancels without dismissing overlays.
+        if matches!(key.code, KeyCode::Esc) {
+            return;
+        }
+        // Any concrete go-to target dismisses overlays that might cover the
+        // destination pane (popup menus, pickers, theme picker, the
+        // media-options view, the help overlay).
+        if matches!(
+            key.code,
+            KeyCode::Char('t' | 'i' | 's' | 'c' | 'n' | 'l' | 'q' | '/' | 'h')
+        ) {
+            self.popup = None;
+            self.library_picker = None;
+            self.playlist_picker = None;
+            self.video_track_picker = None;
+            self.media_options_view = None;
+            self.theme_picker = None;
+            self.show_help = false;
+        }
+        match key.code {
+            KeyCode::Char('t') => self.focus = Pane::TopBar,
+            KeyCode::Char('i') => self.focus = Pane::LibraryItems,
+            KeyCode::Char('s') => self.focus = Pane::LibrarySections,
+            KeyCode::Char('c') => self.focus = Pane::Content,
+            KeyCode::Char('n') => {
+                self.focus = Pane::ContextTop;
+                self.set_context_view(ContextTopView::Info);
+            }
+            KeyCode::Char('l') => {
+                self.focus = Pane::ContextTop;
+                self.set_context_view(ContextTopView::Lyrics);
+            }
+            KeyCode::Char('q') => self.focus = Pane::ContextBottom,
+            KeyCode::Char('/') => {
+                self.search_query = Some(String::new());
+                self.focus = Pane::TopBar;
+                self.status_message = None;
+            }
+            KeyCode::Char('h') => self.show_help = true,
+            _ => {}
+        }
+    }
+
+    /// Accessor for the renderer: `true` while the go-to cheatsheet should be
+    /// shown in the status row.
+    pub fn awaiting_go_to(&self) -> bool {
+        self.awaiting_go_to
     }
 
     /// Handle a keystroke while the search input is focused.
@@ -1205,9 +1477,9 @@ impl App {
                 let entries = self
                     .item_menu_entries()
                     .into_iter()
-                    .map(|(label, _)| label.to_string())
+                    .map(|(label, _)| label)
                     .collect();
-                Some(("Item options", entries, selected))
+                Some(("Actions", entries, selected))
             }
             PopupMenu::Client(selected) => {
                 let entries = self
@@ -1222,8 +1494,8 @@ impl App {
 
     /// Entries shown in the per-item popup. Built from the focused item so the
     /// list reflects what's actually possible (e.g. Play is hidden on folders).
-    fn item_menu_entries(&self) -> Vec<(&'static str, ItemMenuAction)> {
-        let mut entries: Vec<(&'static str, ItemMenuAction)> = Vec::new();
+    fn item_menu_entries(&self) -> Vec<(String, ItemMenuAction)> {
+        let mut entries: Vec<(String, ItemMenuAction)> = Vec::new();
         let Some(item) = self.current_item() else {
             return entries;
         };
@@ -1232,10 +1504,10 @@ impl App {
         // either lyrics or info; each entry switches the context pane to its
         // view and fetches the data it needs.
         if is_audio {
-            entries.push(("Show lyrics", ItemMenuAction::ShowLyrics));
-            entries.push(("Show info", ItemMenuAction::LoadInfo));
+            entries.push(("Show lyrics".to_string(), ItemMenuAction::ShowLyrics));
+            entries.push(("Show info".to_string(), ItemMenuAction::LoadInfo));
         } else {
-            entries.push(("Load info", ItemMenuAction::LoadInfo));
+            entries.push(("Load info".to_string(), ItemMenuAction::LoadInfo));
         }
         let playable = !item.is_folder
             && matches!(
@@ -1243,14 +1515,50 @@ impl App {
                 MediaKind::Video | MediaKind::Audio,
             );
         if playable {
-            entries.push(("Play", ItemMenuAction::Play));
+            entries.push(("Play".to_string(), ItemMenuAction::Play));
         }
         let fav_label = if item.is_favorite {
             "Remove from favorites"
         } else {
             "Add to favorites"
         };
-        entries.push((fav_label, ItemMenuAction::ToggleFavorite));
+        entries.push((fav_label.to_string(), ItemMenuAction::ToggleFavorite));
+        entries.push(("Add to playlist…".to_string(), ItemMenuAction::AddToPlaylist));
+        if is_audio {
+            entries.push(("Instant mix".to_string(), ItemMenuAction::InstantMix));
+            entries.push(("Dislike track".to_string(), ItemMenuAction::Dislike));
+        }
+        let is_video = matches!(
+            MediaKind::classify(item.kind.as_deref()),
+            MediaKind::Video,
+        );
+        if is_video {
+            let sel = self
+                .video_track_selections
+                .get(item.id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            entries.push((
+                format!("Audio track: {}", track_choice_label(sel.audio)),
+                ItemMenuAction::AudioTrack,
+            ));
+            entries.push((
+                format!("Subtitles: {}", track_choice_label(sel.subtitle)),
+                ItemMenuAction::Subtitles,
+            ));
+        }
+        entries.push((
+            format!("Shuffle: {}", if self.shuffle { "on" } else { "off" }),
+            ItemMenuAction::ToggleShuffle,
+        ));
+        entries.push((
+            format!("Repeat: {}", self.repeat_mode.label()),
+            ItemMenuAction::CycleRepeat,
+        ));
+        entries.push((
+            "Copy URL to clipboard".to_string(),
+            ItemMenuAction::CopyUrl,
+        ));
         entries
     }
 
@@ -1259,16 +1567,10 @@ impl App {
     fn client_menu_entries(&self) -> Vec<(String, ClientMenuAction)> {
         vec![
             ("Theme…".to_string(), ClientMenuAction::Themes),
+            ("Sync with server now".to_string(), ClientMenuAction::SyncNow),
             (
-                format!(
-                    "Shuffle: {}",
-                    if self.shuffle { "on" } else { "off" }
-                ),
-                ClientMenuAction::ToggleShuffle,
-            ),
-            (
-                format!("Repeat: {}", self.repeat_mode.label()),
-                ClientMenuAction::CycleRepeat,
+                "Visible libraries…".to_string(),
+                ClientMenuAction::VisibleLibraries,
             ),
             ("Quit".to_string(), ClientMenuAction::Quit),
         ]
@@ -1363,15 +1665,292 @@ impl App {
             }
             ItemMenuAction::Play => self.activate(),
             ItemMenuAction::ToggleFavorite => self.toggle_favorite(),
+            ItemMenuAction::AddToPlaylist => self.open_playlist_picker(),
+            ItemMenuAction::InstantMix => {
+                if let Some(item) = self.current_item().cloned() {
+                    self.set_status(format!("Instant mix: {}", item.name));
+                    self.pending.push(Intent::InstantMix { item });
+                }
+            }
+            ItemMenuAction::Dislike => {
+                if let Some(item) = self.current_item().cloned() {
+                    self.set_status(format!("Disliked: {}", item.name));
+                    self.pending.push(Intent::Dislike { item_id: item.id });
+                }
+            }
+            ItemMenuAction::AudioTrack => self.open_video_track_picker(VideoTrackKind::Audio),
+            ItemMenuAction::Subtitles => self.open_video_track_picker(VideoTrackKind::Subtitle),
+            ItemMenuAction::ToggleShuffle => self.toggle_shuffle(),
+            ItemMenuAction::CycleRepeat => self.cycle_repeat(),
+            ItemMenuAction::CopyUrl => {
+                if let Some(item) = self.current_item().cloned() {
+                    self.pending.push(Intent::CopyItemUrl {
+                        item_id: item.id,
+                        item_name: item.name,
+                    });
+                }
+            }
         }
     }
 
     fn activate_client_action(&mut self, action: ClientMenuAction) {
         match action {
             ClientMenuAction::Themes => self.open_theme_picker(),
-            ClientMenuAction::ToggleShuffle => self.toggle_shuffle(),
-            ClientMenuAction::CycleRepeat => self.cycle_repeat(),
+            ClientMenuAction::SyncNow => {
+                self.set_status("Syncing with server…");
+                self.pending.push(Intent::SyncLibraries);
+            }
+            ClientMenuAction::VisibleLibraries => self.open_library_picker(),
             ClientMenuAction::Quit => self.should_quit = true,
+        }
+    }
+
+    /// Open the visible-library picker. Entries are filled async via
+    /// `Intent::LoadAllLibraryMeta`.
+    fn open_library_picker(&mut self) {
+        self.library_picker = Some(LibraryPickerState {
+            entries: Vec::new(),
+            selected: 0,
+            loading: true,
+        });
+        self.pending.push(Intent::LoadAllLibraryMeta);
+    }
+
+    /// Open the audio / subtitle track picker for the focused video item.
+    fn open_video_track_picker(&mut self, kind: VideoTrackKind) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if !matches!(MediaKind::classify(item.kind.as_deref()), MediaKind::Video) {
+            return;
+        }
+        self.video_track_picker = Some(VideoTrackPickerState {
+            item_id: item.id.clone(),
+            item_name: item.name,
+            kind,
+            entries: None,
+            selected: 0,
+        });
+        self.pending.push(Intent::LoadVideoTracks {
+            item_id: item.id,
+            kind,
+        });
+    }
+
+    /// Picker accessor for the renderer.
+    pub fn video_track_picker(&self) -> Option<&VideoTrackPickerState> {
+        self.video_track_picker.as_ref()
+    }
+
+    /// Populate the open video track picker (called by the loop on response).
+    pub fn set_video_track_picker_entries(&mut self, entries: Vec<TrackPickerEntry>) {
+        if let Some(picker) = self.video_track_picker.as_mut() {
+            picker.entries = Some(entries);
+            picker.selected = 0;
+        }
+    }
+
+    /// Read-only access for [`Playback`] when launching mpv.
+    pub fn video_options_for(&self, item_id: &str) -> VideoOptions {
+        let selection = self
+            .video_track_selections
+            .get(item_id)
+            .cloned()
+            .unwrap_or_default();
+        VideoOptions {
+            audio: Some(selection.audio),
+            subtitle: Some(selection.subtitle),
+        }
+    }
+
+    /// The chosen alternate media-source id for `item_id`, when one was
+    /// picked in the media-options view. `None` ⇒ use Jellyfin's default.
+    pub fn video_media_source_for(&self, item_id: &str) -> Option<String> {
+        self.video_track_selections
+            .get(item_id)
+            .and_then(|s| s.media_source_id.clone())
+    }
+
+    /// Open the playlist picker for the focused audio item. Entries are
+    /// filled async via `Intent::LoadPlaylists`.
+    fn open_playlist_picker(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        self.playlist_picker = Some(PlaylistPickerState {
+            target_item_id: item.id.clone(),
+            target_item_name: item.name,
+            entries: None,
+            selected: 0,
+        });
+        self.pending.push(Intent::LoadPlaylists {
+            target_item_id: item.id,
+        });
+    }
+
+    /// Picker accessor for the renderer.
+    pub fn library_picker(&self) -> Option<&LibraryPickerState> {
+        self.library_picker.as_ref()
+    }
+
+    /// Picker accessor for the renderer.
+    pub fn playlist_picker(&self) -> Option<&PlaylistPickerState> {
+        self.playlist_picker.as_ref()
+    }
+
+    /// Populate the open library picker with the server's full library list,
+    /// marking each entry's current visibility. Called by the loop on
+    /// `LoadAllLibraryMeta` completion.
+    pub fn set_library_picker_entries(&mut self, entries: Vec<(String, String, bool)>) {
+        if let Some(picker) = self.library_picker.as_mut() {
+            picker.entries = entries;
+            picker.loading = false;
+            picker.selected = 0;
+        }
+    }
+
+    /// Populate the open playlist picker with the user's playlists.
+    pub fn set_playlist_picker_entries(&mut self, entries: Vec<(String, String)>) {
+        if let Some(picker) = self.playlist_picker.as_mut() {
+            picker.entries = Some(entries);
+            picker.selected = 0;
+        }
+    }
+
+    /// Replace `libraries` after a sync. Resets the drill stack to the active
+    /// library's root; falls back to library 0 if the previous selection's id
+    /// no longer exists.
+    pub fn replace_libraries(&mut self, libraries: Vec<Library>) {
+        let previous_id = self
+            .libraries
+            .get(self.library_selected)
+            .map(|l| l.id.clone());
+        self.libraries = libraries;
+        self.library_selected = previous_id
+            .and_then(|id| self.libraries.iter().position(|l| l.id == id))
+            .unwrap_or(0);
+        self.reset_stack_for_library();
+        self.set_status("Sync complete");
+    }
+
+    fn handle_library_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.library_picker.as_mut() else {
+            return;
+        };
+        if picker.loading {
+            if matches!(key.code, KeyCode::Esc) {
+                self.library_picker = None;
+            }
+            return;
+        }
+        let len = picker.entries.len();
+        if len == 0 {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.library_picker = None;
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.library_picker = None,
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => picker.selected = (picker.selected + 1).min(len - 1),
+            KeyCode::Char(' ') => {
+                let i = picker.selected;
+                picker.entries[i].2 = !picker.entries[i].2;
+            }
+            KeyCode::Enter => {
+                let visible: Vec<String> = picker
+                    .entries
+                    .iter()
+                    .filter(|(_, _, on)| *on)
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                self.library_picker = None;
+                self.set_status("Saving libraries…");
+                self.pending.push(Intent::SaveVisibleLibraries(visible));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_video_track_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.video_track_picker.as_mut() else {
+            return;
+        };
+        let Some(entries) = picker.entries.as_ref() else {
+            if matches!(key.code, KeyCode::Esc) {
+                self.video_track_picker = None;
+            }
+            return;
+        };
+        if entries.is_empty() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.video_track_picker = None;
+            }
+            return;
+        }
+        let len = entries.len();
+        match key.code {
+            KeyCode::Esc => self.video_track_picker = None,
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => picker.selected = (picker.selected + 1).min(len - 1),
+            KeyCode::Enter => {
+                let entry = entries[picker.selected].clone();
+                let item_id = picker.item_id.clone();
+                let item_name = picker.item_name.clone();
+                let kind = picker.kind;
+                self.video_track_picker = None;
+                let selection = self
+                    .video_track_selections
+                    .entry(item_id)
+                    .or_default();
+                match kind {
+                    VideoTrackKind::Audio => selection.audio = entry.choice,
+                    VideoTrackKind::Subtitle => selection.subtitle = entry.choice,
+                }
+                let kind_label = match kind {
+                    VideoTrackKind::Audio => "Audio",
+                    VideoTrackKind::Subtitle => "Subtitles",
+                };
+                self.set_status(format!("{kind_label} → {} ({})", entry.label, item_name));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_playlist_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.playlist_picker.as_mut() else {
+            return;
+        };
+        let Some(entries) = picker.entries.as_ref() else {
+            if matches!(key.code, KeyCode::Esc) {
+                self.playlist_picker = None;
+            }
+            return;
+        };
+        if entries.is_empty() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.playlist_picker = None;
+            }
+            return;
+        }
+        let len = entries.len();
+        match key.code {
+            KeyCode::Esc => self.playlist_picker = None,
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => picker.selected = (picker.selected + 1).min(len - 1),
+            KeyCode::Enter => {
+                let (playlist_id, playlist_name) = entries[picker.selected].clone();
+                let item_id = picker.target_item_id.clone();
+                let item_name = picker.target_item_name.clone();
+                self.playlist_picker = None;
+                self.set_status(format!("Added “{item_name}” → {playlist_name}"));
+                self.pending.push(Intent::AddToPlaylist {
+                    playlist_id,
+                    item_id,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -1417,17 +1996,196 @@ impl App {
             return;
         }
         match MediaKind::classify(item.kind.as_deref()) {
-            media @ (MediaKind::Video | MediaKind::Audio) => {
-                self.pending.push(Intent::Play { item, media });
-            }
+            MediaKind::Video => self.open_media_options_view(item),
+            MediaKind::Audio => self
+                .pending
+                .push(Intent::Play { item, media: MediaKind::Audio }),
             MediaKind::Other => {
                 self.status_message = Some(format!("Not playable: {}", item.name));
             }
         }
     }
 
+    /// Reveal the item (so the info pane fetches) and open the pre-play
+    /// content pane with the version + track lists. The lists are populated
+    /// async via `Intent::LoadMediaOptions`.
+    fn open_media_options_view(&mut self, item: Item) {
+        self.reveal_item(item.id.clone());
+        self.set_context_view(ContextTopView::Info);
+        self.pending.push(Intent::LoadCurrentDetail {
+            item_id: item.id.clone(),
+            kind: item.kind.clone(),
+        });
+        self.media_options_view = Some(MediaOptionsViewState {
+            item_id: item.id.clone(),
+            item_name: item.name.clone(),
+            loading: true,
+            versions: Vec::new(),
+            audio_entries: Vec::new(),
+            subtitle_entries: Vec::new(),
+            selected_version: 0,
+            selected_audio: 0,
+            selected_subtitle: 0,
+            cursor: MediaOptionsCursor::Play,
+            trailer_urls: Vec::new(),
+        });
+        self.focus = Pane::Content;
+        self.pending.push(Intent::LoadMediaOptions { item_id: item.id });
+    }
+
+    /// Renderer accessor.
+    pub fn media_options_view(&self) -> Option<&MediaOptionsViewState> {
+        self.media_options_view.as_ref()
+    }
+
+    /// Fill the media-options view with the freshly-fetched lists. Preserves
+    /// any prior per-item selection so reopening the view remembers choices.
+    pub fn set_media_options_view_data(
+        &mut self,
+        item_id: &str,
+        versions: Vec<MediaVersion>,
+        audio_entries: Vec<TrackPickerEntry>,
+        subtitle_entries: Vec<TrackPickerEntry>,
+    ) {
+        let Some(view) = self.media_options_view.as_mut() else {
+            return;
+        };
+        if view.item_id != item_id {
+            return;
+        }
+        let stored = self.video_track_selections.get(item_id);
+        let stored_version = stored.and_then(|s| s.media_source_id.clone());
+        view.selected_version = stored_version
+            .as_deref()
+            .and_then(|sid| versions.iter().position(|v| v.source_id == sid))
+            .unwrap_or(0);
+        view.selected_audio = stored
+            .map(|s| s.audio)
+            .and_then(|c| audio_entries.iter().position(|e| e.choice == c))
+            .unwrap_or(0);
+        view.selected_subtitle = stored
+            .map(|s| s.subtitle)
+            .and_then(|c| subtitle_entries.iter().position(|e| e.choice == c))
+            .unwrap_or(0);
+        view.versions = versions;
+        view.audio_entries = audio_entries;
+        view.subtitle_entries = subtitle_entries;
+        view.loading = false;
+        view.cursor = if view.versions.len() > 1 {
+            MediaOptionsCursor::Version(view.selected_version)
+        } else if !view.audio_entries.is_empty() {
+            MediaOptionsCursor::Audio(view.selected_audio)
+        } else {
+            MediaOptionsCursor::Play
+        };
+    }
+
+    /// Drop the media-options view (e.g. on Back).
+    pub fn close_media_options_view(&mut self) {
+        self.media_options_view = None;
+    }
+
+    fn handle_media_options_key(&mut self, key: KeyEvent) {
+        let Some(view) = self.media_options_view.as_mut() else {
+            return;
+        };
+        if view.loading {
+            if matches!(key.code, KeyCode::Esc) {
+                self.media_options_view = None;
+                self.focus = Pane::LibraryItems;
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.media_options_view = None;
+                self.focus = Pane::LibraryItems;
+            }
+            KeyCode::Backspace => {
+                self.media_options_view = None;
+                self.focus = Pane::LibraryItems;
+            }
+            KeyCode::Up => view.cursor = move_options_cursor(view, -1),
+            KeyCode::Down => view.cursor = move_options_cursor(view, 1),
+            KeyCode::Enter => self.commit_media_options_cursor(),
+            _ => {}
+        }
+    }
+
+    fn commit_media_options_cursor(&mut self) {
+        let view = match self.media_options_view.as_mut() {
+            Some(v) => v,
+            None => return,
+        };
+        match view.cursor {
+            MediaOptionsCursor::Version(n) => {
+                view.selected_version = n;
+            }
+            MediaOptionsCursor::Audio(n) => {
+                view.selected_audio = n;
+            }
+            MediaOptionsCursor::Subtitle(n) => {
+                view.selected_subtitle = n;
+            }
+            MediaOptionsCursor::WatchTrailer => {
+                let url = view.trailer_urls.first().cloned();
+                let title = view.item_name.clone();
+                if let Some(url) = url {
+                    self.set_status(format!("Trailer: {title}"));
+                    self.pending.push(Intent::WatchTrailer { url, title });
+                }
+            }
+            MediaOptionsCursor::Play => {
+                let item_id = view.item_id.clone();
+                let item_name = view.item_name.clone();
+                let audio = view
+                    .audio_entries
+                    .get(view.selected_audio)
+                    .map(|e| e.choice)
+                    .unwrap_or(TrackChoice::Auto);
+                let subtitle = view
+                    .subtitle_entries
+                    .get(view.selected_subtitle)
+                    .map(|e| e.choice)
+                    .unwrap_or(TrackChoice::Auto);
+                let media_source_id = view
+                    .versions
+                    .get(view.selected_version)
+                    .map(|v| v.source_id.clone());
+                let selection = VideoTrackSelection {
+                    audio,
+                    subtitle,
+                    media_source_id,
+                };
+                self.video_track_selections
+                    .insert(item_id.clone(), selection);
+                self.media_options_view = None;
+                self.focus = Pane::LibraryItems;
+                let item = Item {
+                    id: item_id,
+                    name: item_name,
+                    kind: Some("Movie".to_string()),
+                    ..Default::default()
+                };
+                self.pending.push(Intent::Play {
+                    item,
+                    media: MediaKind::Video,
+                });
+            }
+        }
+    }
+
     /// Push a loading level for `item`, queue the fetch of its children, and
-    /// move focus to the middle pane where the children will render.
+    /// move focus to the middle pane where the children will render. Also
+    /// reveals the item so the right-top info pane auto-fetches.
+    ///
+    /// Focus shift behaviour:
+    /// - Music libraries shift focus to the Content pane (the drilled-in
+    ///   album/playlist track list is what the user wants next).
+    /// - Every other library type keeps focus on the items pane so the info
+    ///   pane on the right keeps rendering the entered series/album/etc.
+    ///   instead of jumping to a child item's info. The user can press `g c`
+    ///   or `Right` to move into the children when they're ready.
     fn drill_into(&mut self, item: &Item) {
         self.stack.push(Level {
             title: item.name.clone(),
@@ -1436,7 +2194,18 @@ impl App {
             selected: 0,
             loading: true,
         });
-        self.focus = Pane::Content;
+        let collection = self
+            .current_library()
+            .and_then(|l| l.collection_type.clone());
+        if collection.as_deref() == Some("music") {
+            self.focus = Pane::Content;
+        }
+        self.reveal_item(item.id.clone());
+        self.set_context_view(ContextTopView::Info);
+        self.pending.push(Intent::LoadCurrentDetail {
+            item_id: item.id.clone(),
+            kind: item.kind.clone(),
+        });
         self.pending.push(Intent::OpenFolder {
             id: item.id.clone(),
             title: item.name.clone(),
@@ -1796,6 +2565,61 @@ pub(crate) fn run_browser(
                     app.reveal_item(item_id);
                     app.set_status("Loading info…");
                 }
+                Intent::SyncLibraries => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        let visible = current_visible_libraries();
+                        br.sync_libraries(visible);
+                    }
+                }
+                Intent::LoadAllLibraryMeta => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        let visible = current_visible_libraries();
+                        br.load_library_meta(visible);
+                    }
+                }
+                Intent::SaveVisibleLibraries(visible_ids) => {
+                    if let Err(e) = persist_visible_libraries(visible_ids.clone()) {
+                        tracing::warn!(error = %e, "couldn't persist visible libraries");
+                    }
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.sync_libraries(Some(visible_ids));
+                    }
+                }
+                Intent::LoadPlaylists { .. } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.load_playlists();
+                    }
+                }
+                Intent::AddToPlaylist { playlist_id, item_id } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.add_to_playlist(playlist_id, item_id);
+                    }
+                }
+                Intent::InstantMix { item } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.instant_mix(item);
+                    }
+                }
+                Intent::Dislike { item_id } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.dislike(item_id);
+                    }
+                }
+                Intent::CopyItemUrl { item_id, item_name } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.copy_item_url(item_id, item_name);
+                    }
+                }
+                Intent::LoadVideoTracks { item_id, kind } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.load_video_tracks(item_id, kind);
+                    }
+                }
+                Intent::LoadMediaOptions { item_id } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.load_media_options(item_id);
+                    }
+                }
                 other => {
                     if let Some(pb) = playback.as_deref_mut() {
                         pb.dispatch(other, app);
@@ -1870,6 +2694,21 @@ fn persist_theme(name: &str) -> Result<()> {
     config.save()
 }
 
+fn persist_visible_libraries(visible: Vec<String>) -> Result<()> {
+    let mut config = crate::config::Config::load()?.unwrap_or_default();
+    config.ui.visible_libraries = Some(visible);
+    config.save()
+}
+
+/// Read the persisted visible-libraries list. `None` (the default for a fresh
+/// install) means "all libraries visible".
+fn current_visible_libraries() -> Option<Vec<String>> {
+    crate::config::Config::load()
+        .ok()
+        .flatten()
+        .and_then(|c| c.ui.visible_libraries)
+}
+
 pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::images::Images>) {
     let area = frame.area();
     let regions = layout::compute(area);
@@ -1906,13 +2745,23 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         theme,
     );
 
-    panes::content::render(
-        frame,
-        regions.content,
-        app.drilled_level(),
-        app.focus == Pane::Content,
-        theme,
-    );
+    if let Some(view) = app.media_options_view() {
+        panes::content::render_media_options(
+            frame,
+            regions.content,
+            view,
+            app.focus == Pane::Content,
+            theme,
+        );
+    } else {
+        panes::content::render(
+            frame,
+            regions.content,
+            app.drilled_level(),
+            app.focus == Pane::Content,
+            theme,
+        );
+    }
 
     let collection_type = app.current_library().and_then(|l| l.collection_type.as_deref());
     let detail = app.current_detail();
@@ -1970,6 +2819,18 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         );
     } else if let Some((names, selected)) = app.theme_picker() {
         theme_picker::render(frame, area, names, selected, theme.name(), theme);
+    } else if let Some(picker) = app.library_picker() {
+        let (title, entries, selected) = render_library_picker_data(picker);
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        popup_menu::render(frame, area, title, &refs, selected, theme);
+    } else if let Some(picker) = app.playlist_picker() {
+        let (title, entries, selected) = render_playlist_picker_data(picker);
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        popup_menu::render(frame, area, title, &refs, selected, theme);
+    } else if let Some(picker) = app.video_track_picker() {
+        let (title, entries, selected) = render_video_track_picker_data(picker);
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        popup_menu::render(frame, area, title, &refs, selected, theme);
     } else if let Some((title, entries, selected)) = app.popup_menu() {
         let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
         popup_menu::render(frame, area, title, &refs, selected, theme);
@@ -1978,7 +2839,128 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
     }
 }
 
+/// Materialise the visible-library picker into the (title, entries, selected)
+/// shape `popup_menu::render` expects.
+fn render_library_picker_data(picker: &LibraryPickerState) -> (&'static str, Vec<String>, usize) {
+    if picker.loading {
+        return (
+            "Visible libraries — Space toggle, Enter save, Esc cancel",
+            vec!["Loading…".to_string()],
+            0,
+        );
+    }
+    if picker.entries.is_empty() {
+        return (
+            "Visible libraries",
+            vec!["No libraries on server".to_string()],
+            0,
+        );
+    }
+    let entries = picker
+        .entries
+        .iter()
+        .map(|(_, name, on)| format!("[{}] {}", if *on { "x" } else { " " }, name))
+        .collect();
+    (
+        "Visible libraries — Space toggle, Enter save, Esc cancel",
+        entries,
+        picker.selected,
+    )
+}
+
+/// Move the media-options cursor `delta` rows up (-1) or down (+1), skipping
+/// non-selectable rows and clamping at the ends.
+fn move_options_cursor(view: &MediaOptionsViewState, delta: i32) -> MediaOptionsCursor {
+    let positions = options_cursor_positions(view);
+    if positions.is_empty() {
+        return MediaOptionsCursor::Play;
+    }
+    let current = positions
+        .iter()
+        .position(|c| *c == view.cursor)
+        .unwrap_or(0);
+    let next = (current as i32 + delta)
+        .clamp(0, positions.len() as i32 - 1) as usize;
+    positions[next]
+}
+
+/// Linearised list of selectable rows in the media-options view, in render
+/// order. Used for keyboard navigation.
+pub(crate) fn options_cursor_positions(view: &MediaOptionsViewState) -> Vec<MediaOptionsCursor> {
+    let mut positions = Vec::new();
+    for i in 0..view.versions.len() {
+        positions.push(MediaOptionsCursor::Version(i));
+    }
+    for i in 0..view.audio_entries.len() {
+        positions.push(MediaOptionsCursor::Audio(i));
+    }
+    for i in 0..view.subtitle_entries.len() {
+        positions.push(MediaOptionsCursor::Subtitle(i));
+    }
+    positions.push(MediaOptionsCursor::Play);
+    if !view.trailer_urls.is_empty() {
+        positions.push(MediaOptionsCursor::WatchTrailer);
+    }
+    positions
+}
+
+/// Short label for a `TrackChoice`, used by the item-menu summary line.
+fn track_choice_label(choice: TrackChoice) -> String {
+    match choice {
+        TrackChoice::Auto => "Auto".to_string(),
+        TrackChoice::Off => "Off".to_string(),
+        TrackChoice::Pick(n) => format!("#{n}"),
+    }
+}
+
+/// Materialise the video track picker into the shape `popup_menu::render`
+/// expects.
+fn render_video_track_picker_data(
+    picker: &VideoTrackPickerState,
+) -> (&'static str, Vec<String>, usize) {
+    let title = match picker.kind {
+        VideoTrackKind::Audio => "Audio track",
+        VideoTrackKind::Subtitle => "Subtitles",
+    };
+    match picker.entries.as_ref() {
+        None => (title, vec!["Loading…".to_string()], 0),
+        Some(entries) if entries.is_empty() => (
+            title,
+            vec!["No tracks reported by server".to_string()],
+            0,
+        ),
+        Some(entries) => (
+            title,
+            entries.iter().map(|e| e.label.clone()).collect(),
+            picker.selected,
+        ),
+    }
+}
+
+/// Materialise the playlist picker into the (title, entries, selected) shape
+/// `popup_menu::render` expects.
+fn render_playlist_picker_data(picker: &PlaylistPickerState) -> (&'static str, Vec<String>, usize) {
+    match picker.entries.as_ref() {
+        None => ("Add to playlist", vec!["Loading…".to_string()], 0),
+        Some(entries) if entries.is_empty() => (
+            "Add to playlist",
+            vec!["No playlists on server".to_string()],
+            0,
+        ),
+        Some(entries) => (
+            "Add to playlist",
+            entries.iter().map(|(_, name)| name.clone()).collect(),
+            picker.selected,
+        ),
+    }
+}
+
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+    if app.awaiting_go_to() {
+        let line = " Go to: t Top · i Items · s Sections · c Content · n Info · l Lyrics · q Queue · / Search · h Help · Esc cancel ";
+        frame.render_widget(Paragraph::new(line).style(app.theme.header()), area);
+        return;
+    }
     let focus_name = match app.focus {
         Pane::TopBar => "Libraries",
         Pane::LibraryItems => "Items",
@@ -1995,7 +2977,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {focus_name}  ·  {}  ·  {item} ", app.breadcrumb())
         }
     };
-    let hint = " Enter open/play · Bksp back · t themes · F1 help · q quit ";
+    let hint = " Enter open/play · Bksp back · g go to · F1 help · q quit ";
 
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Min(0),
@@ -2181,22 +3163,109 @@ mod tests {
     }
 
     #[test]
-    fn enter_queues_play_intent_for_playable_items() {
+    fn enter_on_video_opens_media_options_view() {
         let mut app = app_with_item("Movie");
         app.handle_key(press(KeyCode::Enter));
+        assert!(app.media_options_view().is_some());
+        assert_eq!(app.focus, Pane::Content);
         let intents = app.take_intents();
-        assert_eq!(intents.len(), 1);
-        assert!(matches!(
-            &intents[0],
-            Intent::Play { media: MediaKind::Video, item } if item.name == "Thing"
-        ));
+        assert!(intents.iter().any(|i| matches!(i, Intent::LoadMediaOptions { .. })));
+        assert!(intents.iter().any(|i| matches!(i, Intent::LoadCurrentDetail { .. })));
+        assert!(!intents.iter().any(|i| matches!(i, Intent::Play { .. })));
+    }
 
+    #[test]
+    fn enter_on_audio_plays_directly() {
         let mut app = app_with_item("Audio");
         app.handle_key(press(KeyCode::Enter));
         assert!(matches!(
             app.take_intents().as_slice(),
             [Intent::Play { media: MediaKind::Audio, .. }]
         ));
+    }
+
+    #[test]
+    fn watch_trailer_row_emits_intent_when_trailer_url_present() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        app.set_media_options_view_data(
+            "id-Thing",
+            vec![],
+            vec![TrackPickerEntry {
+                label: "Auto".to_string(),
+                choice: TrackChoice::Auto,
+            }],
+            vec![TrackPickerEntry {
+                label: "Auto".to_string(),
+                choice: TrackChoice::Auto,
+            }],
+        );
+        app.set_current_detail(
+            "id-Thing",
+            ItemDetail {
+                trailer_urls: vec!["https://youtu.be/abc".to_string()],
+                ..Default::default()
+            },
+        );
+        // Cursor starts on Audio(0); navigate to WatchTrailer (last row).
+        loop {
+            let cursor = app.media_options_view().unwrap().cursor;
+            if matches!(cursor, MediaOptionsCursor::WatchTrailer) {
+                break;
+            }
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::WatchTrailer { url, .. }] if url == "https://youtu.be/abc"
+        ));
+    }
+
+    #[test]
+    fn media_options_play_row_emits_play_with_chosen_options() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        app.set_media_options_view_data(
+            "id-Thing",
+            vec![MediaVersion {
+                source_id: "src-a".to_string(),
+                label: "Original".to_string(),
+            }],
+            vec![
+                TrackPickerEntry {
+                    label: "Auto".to_string(),
+                    choice: TrackChoice::Auto,
+                },
+                TrackPickerEntry {
+                    label: "#1 English".to_string(),
+                    choice: TrackChoice::Pick(1),
+                },
+            ],
+            vec![TrackPickerEntry {
+                label: "Off".to_string(),
+                choice: TrackChoice::Off,
+            }],
+        );
+        // Cursor lands on Audio(0) since there's only one version.
+        // Navigate Down to Audio(1), commit (selects audio).
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        // Down → Subtitle(0), commit (selects Off subs).
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        // Down → Play, commit.
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.media_options_view().is_none());
+        let intents = app.take_intents();
+        let played = intents.iter().any(|i| matches!(i, Intent::Play { .. }));
+        assert!(played, "Play intent should be emitted");
+        let options = app.video_options_for("id-Thing");
+        assert!(matches!(options.audio, Some(TrackChoice::Pick(1))));
+        assert!(matches!(options.subtitle, Some(TrackChoice::Off)));
     }
 
     #[test]
@@ -2218,11 +3287,13 @@ mod tests {
         let level = app.current_level().unwrap();
         assert!(level.loading);
         assert_eq!(level.parent_id, "id-Thing");
-        // …and an OpenFolder intent is queued for the loader.
-        assert!(matches!(
-            app.take_intents().as_slice(),
-            [Intent::OpenFolder { id, .. }] if id == "id-Thing"
-        ));
+        // …and an OpenFolder intent is queued for the loader (plus the
+        // auto-reveal that fetches detail for the right-top info pane).
+        let intents = app.take_intents();
+        assert!(intents.iter().any(|i| matches!(i, Intent::LoadCurrentDetail { .. })));
+        assert!(intents
+            .iter()
+            .any(|i| matches!(i, Intent::OpenFolder { id, .. } if id == "id-Thing")));
     }
 
     #[test]
@@ -2246,14 +3317,15 @@ mod tests {
 
     #[test]
     fn left_in_drilled_list_goes_up_a_level() {
-        // Initial focus is LibraryItems; Enter drills into the folder, which
-        // now opens the children in the middle pane and moves focus there.
+        // Initial focus is LibraryItems; Enter on a Series in a non-music
+        // library now keeps focus on the items list so the info pane stays on
+        // the entered show. Backspace pops the drilled level.
         let mut app = app_with_item("Series");
         app.handle_key(press(KeyCode::Enter)); // drill in
         let _ = app.take_intents();
         assert!(app.is_drilled());
-        assert_eq!(app.focus, Pane::Content);
-        app.handle_key(press(KeyCode::Left)); // pops the level, restores list focus
+        assert_eq!(app.focus, Pane::LibraryItems);
+        app.handle_key(press(KeyCode::Backspace));
         assert!(!app.is_drilled());
         assert_eq!(app.focus, Pane::LibraryItems);
     }
@@ -3024,7 +4096,7 @@ mod tests {
         app.handle_key(press(KeyCode::Char('p')));
         // Menu is open with "Load info" highlighted first.
         let (title, entries, sel) = app.popup_menu().expect("item menu open");
-        assert_eq!(title, "Item options");
+        assert_eq!(title, "Actions");
         assert_eq!(sel, 0);
         assert_eq!(entries[0], "Load info");
         // Enter on "Load info" closes the menu and queues a detail fetch.
@@ -3051,6 +4123,331 @@ mod tests {
         app.handle_key(press(KeyCode::Enter));
         assert!(app.popup_menu().is_none());
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn client_menu_includes_sync_and_visible_libraries() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        let (_, entries, _) = app.popup_menu().expect("client menu open");
+        assert!(entries.iter().any(|e| e == "Sync with server now"));
+        assert!(entries.iter().any(|e| e == "Visible libraries…"));
+    }
+
+    #[test]
+    fn sync_now_entry_emits_sync_intent() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        // Client menu: Theme, Sync, Visible, Quit. "Sync" is index 1.
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::SyncLibraries]
+        ));
+    }
+
+    #[test]
+    fn visible_libraries_entry_opens_picker_and_emits_load_intent() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.library_picker().is_some());
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::LoadAllLibraryMeta]
+        ));
+    }
+
+    #[test]
+    fn library_picker_save_emits_visible_libraries_intent() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        for _ in 0..2 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        app.set_library_picker_entries(vec![
+            ("lib-a".to_string(), "Movies".to_string(), true),
+            ("lib-b".to_string(), "Music".to_string(), true),
+        ]);
+        // Space toggles entry 0 off.
+        app.handle_key(press(KeyCode::Char(' ')));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.library_picker().is_none());
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::SaveVisibleLibraries(ids)] if ids == &vec!["lib-b".to_string()]
+        ));
+    }
+
+    #[test]
+    fn item_menu_includes_audio_specific_actions() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Track A", "Audio")],
+        }]);
+        app.handle_key(press(KeyCode::Char('p')));
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        assert!(entries.iter().any(|e| e == "Add to playlist…"));
+        assert!(entries.iter().any(|e| e == "Instant mix"));
+        assert!(entries.iter().any(|e| e == "Dislike track"));
+        assert!(entries.iter().any(|e| e == "Copy URL to clipboard"));
+    }
+
+    #[test]
+    fn item_menu_hides_audio_actions_for_video_items() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        // Instant mix + Dislike are audio-only; the rest of the menu is universal.
+        assert!(!entries.iter().any(|e| e == "Instant mix"));
+        assert!(!entries.iter().any(|e| e == "Dislike track"));
+        assert!(entries.iter().any(|e| e == "Add to playlist…"));
+        assert!(entries.iter().any(|e| e == "Copy URL to clipboard"));
+    }
+
+    #[test]
+    fn instant_mix_entry_emits_intent() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Track A", "Audio")],
+        }]);
+        app.handle_key(press(KeyCode::Char('p')));
+        // Order: Show lyrics, Show info, Play, Add to favorites,
+        // Add to playlist…, Instant mix, Dislike, Copy URL.
+        for _ in 0..5 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::InstantMix { item }] if item.name == "Track A"
+        ));
+    }
+
+    #[test]
+    fn dislike_entry_emits_intent() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Track A", "Audio")],
+        }]);
+        app.handle_key(press(KeyCode::Char('p')));
+        for _ in 0..6 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::Dislike { item_id }] if item_id == "id-Track A"
+        ));
+    }
+
+    #[test]
+    fn copy_url_entry_emits_intent() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        // Movie order: Load info, Play, Add to favorites, Copy URL.
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        let copy_index = entries
+            .iter()
+            .position(|e| e == "Copy URL to clipboard")
+            .expect("Copy URL entry present");
+        for _ in 0..copy_index {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::CopyItemUrl { item_id, .. }] if item_id == "id-Thing"
+        ));
+    }
+
+    #[test]
+    fn add_to_playlist_entry_opens_picker_and_enter_emits_intent() {
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![typed_item("Track A", "Audio")],
+        }]);
+        app.handle_key(press(KeyCode::Char('p')));
+        // Walk to "Add to playlist…" (index 4).
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.playlist_picker().is_some());
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::LoadPlaylists { target_item_id }] if target_item_id == "id-Track A"
+        ));
+        app.set_playlist_picker_entries(vec![("pl-1".to_string(), "Drive Mix".to_string())]);
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.playlist_picker().is_none());
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::AddToPlaylist { playlist_id, item_id }]
+                if playlist_id == "pl-1" && item_id == "id-Track A"
+        ));
+    }
+
+    #[test]
+    fn video_item_menu_includes_track_entries() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        assert!(entries.iter().any(|e| e.starts_with("Audio track:")));
+        assert!(entries.iter().any(|e| e.starts_with("Subtitles:")));
+    }
+
+    #[test]
+    fn audio_track_entry_opens_picker_and_enter_records_choice() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        let idx = entries
+            .iter()
+            .position(|e| e.starts_with("Audio track:"))
+            .expect("Audio track entry");
+        for _ in 0..idx {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.video_track_picker().is_some());
+        assert!(matches!(
+            app.take_intents().as_slice(),
+            [Intent::LoadVideoTracks { item_id, kind }]
+                if item_id == "id-Thing" && *kind == VideoTrackKind::Audio
+        ));
+        app.set_video_track_picker_entries(vec![
+            TrackPickerEntry {
+                label: "Auto".to_string(),
+                choice: TrackChoice::Auto,
+            },
+            TrackPickerEntry {
+                label: "#1 English".to_string(),
+                choice: TrackChoice::Pick(1),
+            },
+        ]);
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.video_track_picker().is_none());
+        let options = app.video_options_for("id-Thing");
+        assert!(matches!(options.audio, Some(TrackChoice::Pick(1))));
+    }
+
+    #[test]
+    fn subtitle_picker_off_sets_off_choice() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Char('p')));
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        let idx = entries
+            .iter()
+            .position(|e| e.starts_with("Subtitles:"))
+            .expect("Subtitles entry");
+        for _ in 0..idx {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        app.set_video_track_picker_entries(vec![
+            TrackPickerEntry {
+                label: "Auto".to_string(),
+                choice: TrackChoice::Auto,
+            },
+            TrackPickerEntry {
+                label: "Off".to_string(),
+                choice: TrackChoice::Off,
+            },
+        ]);
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        let options = app.video_options_for("id-Thing");
+        assert!(matches!(options.subtitle, Some(TrackChoice::Off)));
+    }
+
+    #[test]
+    fn go_to_prefix_then_target_changes_focus() {
+        let mut app = App::new();
+        // g + s → Sections pane
+        app.handle_key(press(KeyCode::Char('g')));
+        assert!(app.awaiting_go_to());
+        app.handle_key(press(KeyCode::Char('s')));
+        assert!(!app.awaiting_go_to());
+        assert_eq!(app.focus, Pane::LibrarySections);
+        // g + t → Top bar (libraries)
+        app.handle_key(press(KeyCode::Char('g')));
+        app.handle_key(press(KeyCode::Char('t')));
+        assert_eq!(app.focus, Pane::TopBar);
+        // g + q → Context bottom (queue)
+        app.handle_key(press(KeyCode::Char('g')));
+        app.handle_key(press(KeyCode::Char('q')));
+        assert_eq!(app.focus, Pane::ContextBottom);
+    }
+
+    #[test]
+    fn go_to_esc_cancels_chord_without_focus_change() {
+        let mut app = App::new();
+        let before = app.focus;
+        app.handle_key(press(KeyCode::Char('g')));
+        assert!(app.awaiting_go_to());
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.awaiting_go_to());
+        assert_eq!(app.focus, before);
+    }
+
+    #[test]
+    fn go_to_slash_opens_search() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('g')));
+        app.handle_key(press(KeyCode::Char('/')));
+        assert_eq!(app.focus, Pane::TopBar);
+        assert!(app.search_query.is_some());
+    }
+
+    #[test]
+    fn go_to_works_from_inside_media_options_view() {
+        let mut app = app_with_item("Movie");
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.media_options_view().is_some());
+        assert_eq!(app.focus, Pane::Content);
+        app.handle_key(press(KeyCode::Char('g')));
+        assert!(app.awaiting_go_to());
+        app.handle_key(press(KeyCode::Char('t')));
+        assert!(!app.awaiting_go_to());
+        assert!(app.media_options_view().is_none());
+        assert_eq!(app.focus, Pane::TopBar);
+    }
+
+    #[test]
+    fn go_to_works_from_inside_popup_menu() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert!(app.popup_menu().is_some());
+        app.handle_key(press(KeyCode::Char('g')));
+        app.handle_key(press(KeyCode::Char('s')));
+        assert!(app.popup_menu().is_none());
+        assert_eq!(app.focus, Pane::LibrarySections);
+    }
+
+    #[test]
+    fn go_to_chips_render_in_status_bar() {
+        let mut app = App::new();
+        app.handle_key(press(KeyCode::Char('g')));
+        let out = rendered(&app, 140, 24);
+        assert!(out.contains("Go to:"), "{out}");
+        assert!(out.contains("Esc cancel"), "{out}");
     }
 
     #[test]

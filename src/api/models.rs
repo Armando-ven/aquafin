@@ -98,6 +98,18 @@ pub struct BaseItemDto {
     /// detail endpoint (`/Items/{id}`) is used.
     pub people: Option<Vec<BaseItemPerson>>,
     pub genres: Option<Vec<String>>,
+    /// External trailer links (e.g. YouTube). Populated for Movies/Series when
+    /// the server has any.
+    pub remote_trailers: Option<Vec<MediaUrl>>,
+    pub local_trailer_count: Option<i32>,
+}
+
+/// A `{Url, Name}` pair from Jellyfin's `RemoteTrailers` field.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct MediaUrl {
+    pub url: Option<String>,
+    pub name: Option<String>,
 }
 
 /// A cast or crew member from a `BaseItemDto.People` entry.
@@ -110,6 +122,42 @@ pub struct BaseItemPerson {
     #[serde(rename = "Type")]
     pub type_: Option<String>,
     pub role: Option<String>,
+}
+
+/// `GET /Items/{itemId}/PlaybackInfo` response (subset). Carries the list of
+/// playable media sources and their embedded streams (audio + subtitle).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PlaybackInfoResponse {
+    pub media_sources: Vec<MediaSource>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct MediaSource {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub container: Option<String>,
+    pub size: Option<i64>,
+    pub run_time_ticks: Option<i64>,
+    pub media_streams: Vec<MediaStream>,
+}
+
+/// One embedded track inside a [`MediaSource`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct MediaStream {
+    #[serde(rename = "Type")]
+    pub type_: Option<String>,
+    /// Absolute stream index inside the file (across all types).
+    pub index: i32,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub display_title: Option<String>,
+    pub codec: Option<String>,
+    pub channel_layout: Option<String>,
+    pub is_default: Option<bool>,
+    pub is_forced: Option<bool>,
 }
 
 /// `GET /Items/{itemId}/Lyrics` response.

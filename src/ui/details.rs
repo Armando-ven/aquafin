@@ -152,6 +152,13 @@ pub(crate) async fn fetch_detail(
     } else {
         (Vec::new(), Vec::new())
     };
+    let trailer_urls = item
+        .remote_trailers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| t.url.filter(|u| !u.is_empty()))
+        .collect();
     Some(ItemDetail {
         overview: item.overview.clone(),
         cast,
@@ -161,6 +168,7 @@ pub(crate) async fn fetch_detail(
         siblings,
         artist_albums,
         appears_on,
+        trailer_urls,
     })
 }
 

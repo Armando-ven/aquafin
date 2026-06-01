@@ -1,7 +1,10 @@
 //! Read-only library queries: views, item listings, detail, images, resume, search.
 
 use super::client::JellyfinClient;
-use super::models::{BaseItemDto, ImageResponse, ItemsQuery, ItemsResult, LyricsDto, SearchHintResult};
+use super::models::{
+    BaseItemDto, ImageResponse, ItemsQuery, ItemsResult, LyricsDto, PlaybackInfoResponse,
+    SearchHintResult,
+};
 use super::Result;
 
 impl JellyfinClient {
@@ -60,6 +63,48 @@ impl JellyfinClient {
     pub async fn lyrics(&self, item_id: &str) -> Result<LyricsDto> {
         let path = format!("/Audio/{item_id}/Lyrics");
         self.send_json(self.get(&path)).await
+    }
+
+    /// `GET /Items/{itemId}/PlaybackInfo` — media sources + embedded audio/subtitle
+    /// streams. Used by the video track pickers.
+    pub async fn playback_info(&self, item_id: &str) -> Result<PlaybackInfoResponse> {
+        let path = format!("/Items/{item_id}/PlaybackInfo");
+        self.send_json(self.get(&path).query(&[("userId", self.user_id())]))
+            .await
+    }
+
+    /// `GET /Items/{itemId}/InstantMix` — auto-generated playlist similar to the item.
+    pub async fn instant_mix(&self, item_id: &str, limit: u32) -> Result<ItemsResult> {
+        let path = format!("/Items/{item_id}/InstantMix");
+        self.send_json(
+            self.get(&path)
+                .query(&[("userId", self.user_id()), ("limit", &limit.to_string())]),
+        )
+        .await
+    }
+
+    /// `POST /Playlists/{playlistId}/Items` — append items to a playlist.
+    pub async fn add_to_playlist(&self, playlist_id: &str, item_ids: &[&str]) -> Result<()> {
+        let path = format!("/Playlists/{playlist_id}/Items");
+        self.send_no_content(self.post(&path).query(&[
+            ("ids", item_ids.join(",")),
+            ("userId", self.user_id().to_string()),
+        ]))
+        .await
+    }
+
+    /// `POST /UserItems/{itemId}/Rating?likes=false` — record like/dislike.
+    pub async fn set_rating(&self, item_id: &str, likes: bool) -> Result<()> {
+        let path = format!("/UserItems/{item_id}/Rating");
+        self.send_no_content(self.post(&path).query(&[("likes", likes.to_string())]))
+            .await
+    }
+
+    /// `DELETE /UserItems/{itemId}/Rating` — clear like/dislike.
+    pub async fn clear_rating(&self, item_id: &str) -> Result<()> {
+        let path = format!("/UserItems/{item_id}/Rating");
+        self.send_no_content(self.request(reqwest::Method::DELETE, &path))
+            .await
     }
 
     /// `GET /Items/{itemId}/Images/Primary` — primary image bytes.

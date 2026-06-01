@@ -48,6 +48,10 @@ pub struct UiConfig {
     /// input cycles through this list.
     #[serde(default)]
     pub search_history: Vec<String>,
+    /// Jellyfin library ids the user has chosen to show. `None` means all
+    /// libraries are visible (default for a fresh config).
+    #[serde(default)]
+    pub visible_libraries: Option<Vec<String>>,
 }
 
 impl Default for UiConfig {
@@ -58,6 +62,7 @@ impl Default for UiConfig {
             section_memory: std::collections::HashMap::new(),
             last_library_id: None,
             search_history: Vec::new(),
+            visible_libraries: None,
         }
     }
 }

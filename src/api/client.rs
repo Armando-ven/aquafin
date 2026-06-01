@@ -63,16 +63,29 @@ impl JellyfinClient {
         &self.token
     }
 
+    /// Public web URL for the item's detail page (used by the "Copy URL"
+    /// affordance). Mirrors what Jellyfin's own web client links look like.
+    pub fn item_web_url(&self, item_id: &str) -> String {
+        format!(
+            "{}/web/index.html#/details?id={}",
+            self.base_url,
+            urlencode(item_id),
+        )
+    }
+
     /// Build a direct-play video URL for `mpv`. The token rides in the query
     /// string (`api_key`) because mpv opens the URL itself and can't set our
     /// `X-Emby-Authorization` header. `static=true` asks the server to stream the
-    /// original file without remuxing.
-    pub fn video_stream_url(&self, item_id: &str) -> String {
+    /// original file without remuxing. `media_source_id = None` defaults to the
+    /// item id (single-source case); items with multiple versions pass the
+    /// chosen source id.
+    pub fn video_stream_url(&self, item_id: &str, media_source_id: Option<&str>) -> String {
+        let source = media_source_id.unwrap_or(item_id);
         format!(
             "{}/Videos/{}/stream?static=true&mediaSourceId={}&api_key={}",
             self.base_url,
             urlencode(item_id),
-            urlencode(item_id),
+            urlencode(source),
             urlencode(&self.token),
         )
     }
@@ -241,7 +254,7 @@ mod tests {
     #[test]
     fn video_stream_url_is_direct_play_with_api_key() {
         let client = JellyfinClient::new("https://jelly.example/", "tok123", "u1", "dev-1").unwrap();
-        let url = client.video_stream_url("itm1");
+        let url = client.video_stream_url("itm1", None);
         assert_eq!(
             url,
             "https://jelly.example/Videos/itm1/stream?static=true&mediaSourceId=itm1&api_key=tok123"

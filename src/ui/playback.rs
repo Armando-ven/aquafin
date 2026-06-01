@@ -94,6 +94,12 @@ impl Playback {
                 }
                 MediaKind::Other => {}
             },
+            Intent::PlayQueueCurrent { item } => {
+                // Queue is already set externally (e.g. Instant Mix); just
+                // play the requested track without rebuilding.
+                self.start_audio(item, app);
+            }
+            Intent::WatchTrailer { url, title } => self.watch_trailer(url, title, app),
             Intent::TogglePause => self.toggle_pause(),
             Intent::Stop => {
                 app.clear_queue();
@@ -134,7 +140,46 @@ impl Playback {
             | Intent::SaveSectionMemory(_)
             | Intent::SaveLastLibrary(_)
             | Intent::SaveSearchHistory(_)
-            | Intent::LoadCurrentDetail { .. } => {}
+            | Intent::LoadCurrentDetail { .. }
+            | Intent::SyncLibraries
+            | Intent::LoadAllLibraryMeta
+            | Intent::SaveVisibleLibraries(_)
+            | Intent::LoadPlaylists { .. }
+            | Intent::AddToPlaylist { .. }
+            | Intent::InstantMix { .. }
+            | Intent::Dislike { .. }
+            | Intent::CopyItemUrl { .. }
+            | Intent::LoadVideoTracks { .. }
+            | Intent::LoadMediaOptions { .. } => {}
+        }
+    }
+
+    /// Launch mpv on an external trailer URL (YouTube, etc). Uses a synthetic
+    /// id so it doesn't collide with any movie session's IPC socket.
+    fn watch_trailer(&mut self, url: String, title: String, app: &mut App) {
+        let socket_id = format!("trailer-{}", title);
+        match video::spawn(&url, &socket_id, &title, video::VideoOptions::default()) {
+            Ok(session) => {
+                if let Some(mut previous) = self.video.take() {
+                    previous.stop.store(true, Ordering::SeqCst);
+                    previous.session.kill();
+                }
+                app.set_status(format!("Trailer in mpv: {title}"));
+                self.video = Some(VideoPlayback {
+                    session,
+                    item: Item {
+                        id: socket_id,
+                        name: title,
+                        ..Default::default()
+                    },
+                    stop: Arc::new(AtomicBool::new(false)),
+                    position_ms: Arc::new(AtomicU64::new(0)),
+                });
+            }
+            Err(VideoError::MpvNotInstalled) => {
+                app.show_error("mpv is not installed or not on PATH. Install mpv to watch trailers.");
+            }
+            Err(e) => app.show_error(format!("Couldn't start mpv: {e}")),
         }
     }
 
@@ -255,8 +300,12 @@ impl Playback {
 
     fn play_video(&mut self, item: Item, app: &mut App) {
         self.stop_audio(); // don't stack in-app audio under a video
-        let url = self.client.video_stream_url(&item.id);
-        match video::spawn(&url, &item.id, &item.name) {
+        let source_id = app.video_media_source_for(&item.id);
+        let url = self
+            .client
+            .video_stream_url(&item.id, source_id.as_deref());
+        let options = app.video_options_for(&item.id);
+        match video::spawn(&url, &item.id, &item.name, options) {
             Ok(session) => {
                 if let Some(mut previous) = self.video.take() {
                     previous.stop.store(true, Ordering::SeqCst);

@@ -41,8 +41,22 @@ pub fn render_top(
                 frame, area, item, detail, scroll, revealed, images, focused, theme,
             ),
         },
-        Some("movies") => render_cast(frame, area, detail, scroll, focused, theme),
-        Some("tvshows") => render_tv_episodes(frame, area, detail, scroll, focused, theme),
+        Some("movies") | Some("tvshows") => {
+            if revealed {
+                render_info(
+                    frame, area, item, detail, scroll, revealed, images, focused, theme,
+                );
+            } else {
+                render_placeholder(
+                    frame,
+                    area,
+                    " Info ",
+                    "Press p → Load info to view cover, description, and cast.",
+                    focused,
+                    theme,
+                );
+            }
+        }
         _ => render_placeholder(frame, area, " Info ", "Select an item.", focused, theme),
     }
 }
@@ -103,6 +117,9 @@ fn render_info(
     if let Some(runtime) = item.run_time_ticks.and_then(format_runtime) {
         meta.push(runtime);
     }
+    if let Some(genres) = detail.map(|d| d.genres.as_slice()).filter(|g| !g.is_empty()) {
+        meta.push(genres.join(", "));
+    }
     if !meta.is_empty() {
         lines.push(Line::from(Span::styled(meta.join("  ·  "), theme.muted())));
     }
@@ -133,14 +150,16 @@ fn render_info(
             Some("Audio" | "AudioBook") => {
                 push_section(&mut lines, "Album tracks", &detail.siblings, theme);
             }
+            Some("Series") => {
+                push_section(&mut lines, "Seasons", &detail.children, theme);
+            }
+            Some("Season") => {
+                push_section(&mut lines, "Episodes", &detail.children, theme);
+            }
+            Some("Episode") => {
+                push_section(&mut lines, "Episodes", &detail.siblings, theme);
+            }
             _ => {}
-        }
-        if !detail.genres.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("Genres: {}", detail.genres.join(", ")),
-                theme.muted(),
-            )));
         }
     }
 
@@ -335,26 +354,6 @@ fn active_lyric_index(lyrics: &[LyricLine], position: Duration) -> Option<usize>
     best
 }
 
-fn render_cast(
-    frame: &mut Frame,
-    area: Rect,
-    detail: Option<&ItemDetail>,
-    scroll: u16,
-    focused: bool,
-    theme: &Theme,
-) {
-    let lines: Vec<Line<'static>> = match detail.map(|d| d.cast.as_slice()) {
-        Some(cast) if !cast.is_empty() => cast
-            .iter()
-            .filter(|p| p.kind.as_deref().is_none_or(is_cast_kind))
-            .map(person_line)
-            .collect(),
-        Some(_) => vec![Line::from("No cast listed.")],
-        None => vec![Line::from("Select an item to load cast.")],
-    };
-    render_scrollable_block(frame, area, " Cast ", lines, scroll, focused, theme);
-}
-
 fn render_credits(
     frame: &mut Frame,
     area: Rect,
@@ -365,12 +364,26 @@ fn render_credits(
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(detail) = detail {
-        if !detail.genres.is_empty() {
-            lines.push(Line::from(format!("Genres: {}", detail.genres.join(", "))));
+        let actors: Vec<&Person> = detail
+            .cast
+            .iter()
+            .filter(|p| p.kind.as_deref().is_none_or(is_cast_kind))
+            .collect();
+        if !actors.is_empty() {
+            lines.push(Line::from(Span::styled("Cast".to_string(), theme.header())));
+            for person in actors {
+                lines.push(person_line(person));
+            }
             lines.push(Line::from(""));
         }
-        for person in &detail.cast {
-            if person.kind.as_deref().is_some_and(is_crew_kind) {
+        let crew: Vec<&Person> = detail
+            .cast
+            .iter()
+            .filter(|p| p.kind.as_deref().is_some_and(is_crew_kind))
+            .collect();
+        if !crew.is_empty() {
+            lines.push(Line::from(Span::styled("Crew".to_string(), theme.header())));
+            for person in crew {
                 lines.push(person_line(person));
             }
         }
@@ -379,20 +392,6 @@ fn render_credits(
         lines.push(Line::from("No credits loaded."));
     }
     render_scrollable_block(frame, area, " Credits ", lines, scroll, focused, theme);
-}
-
-/// TV context, top pane. For a Series this is the list of seasons; for a
-/// Season the episodes; for an Episode the season-mates fetched as siblings.
-fn render_tv_episodes(
-    frame: &mut Frame,
-    area: Rect,
-    detail: Option<&ItemDetail>,
-    scroll: u16,
-    focused: bool,
-    theme: &Theme,
-) {
-    let (title, items, fallback) = pick_tv_top(detail);
-    render_item_list(frame, area, title, items, fallback, scroll, focused, theme);
 }
 
 /// TV context, bottom pane. Crude pairing of "what's next to this": for an
@@ -408,24 +407,6 @@ fn render_tv_seasons(
 ) {
     let (title, items, fallback) = pick_tv_bottom(detail);
     render_item_list(frame, area, title, items, fallback, scroll, focused, theme);
-}
-
-fn pick_tv_top(detail: Option<&ItemDetail>) -> (&'static str, Vec<&Item>, &'static str) {
-    let Some(detail) = detail else {
-        return (" Episodes ", Vec::new(), "Select an item.");
-    };
-    if !detail.children.is_empty() {
-        let title = if detail.children.iter().all(|i| i.kind.as_deref() == Some("Season")) {
-            " Seasons "
-        } else {
-            " Episodes "
-        };
-        return (title, detail.children.iter().collect(), "");
-    }
-    if !detail.siblings.is_empty() {
-        return (" Episodes ", detail.siblings.iter().collect(), "");
-    }
-    (" Episodes ", Vec::new(), "No episodes loaded.")
 }
 
 fn pick_tv_bottom(detail: Option<&ItemDetail>) -> (&'static str, Vec<&Item>, &'static str) {

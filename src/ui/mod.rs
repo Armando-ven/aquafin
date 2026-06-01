@@ -71,11 +71,12 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
     };
 
     let libraries = match &client {
-        Some(client) => load_libraries(runtime, client).unwrap_or_else(|e| {
-            tracing::error!(error = %e, "failed to load library data");
-            startup_error.get_or_insert(format!("Couldn't load your libraries:\n{e}"));
-            Vec::new()
-        }),
+        Some(client) => load_libraries(runtime, client, config.ui.visible_libraries.as_deref())
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to load library data");
+                startup_error.get_or_insert(format!("Couldn't load your libraries:\n{e}"));
+                Vec::new()
+            }),
         None => Vec::new(),
     };
 
@@ -142,33 +143,31 @@ fn build_client() -> Result<api::JellyfinClient> {
 }
 
 /// Load the user's libraries + items. Blocks (one-time startup load); the main
-/// loop stays input-driven afterward.
+/// loop stays input-driven afterward. `visible` filters to that subset of
+/// library ids (in that order); `None` shows everything in server order.
 fn load_libraries(
     runtime: &tokio::runtime::Runtime,
     client: &api::JellyfinClient,
+    visible: Option<&[String]>,
 ) -> Result<Vec<app::Library>> {
     let client = client.clone();
+    let visible = visible.map(|v| v.to_vec());
     runtime.block_on(async move {
-        let views = client.user_views().await?;
-        let mut libraries = Vec::with_capacity(views.len());
-        for view in views {
-            let result = client
-                .items(&api::models::ItemsQuery {
-                    parent_id: Some(view.id.clone()),
-                    limit: Some(200),
-                    fields: vec!["Overview".to_string()],
-                    ..Default::default()
-                })
-                .await?;
-            libraries.push(app::Library {
-                id: view.id,
-                name: view.name.unwrap_or_else(|| "(library)".to_string()),
-                collection_type: view.collection_type,
-                items: result.items.into_iter().map(item_from_dto).collect(),
-            });
-        }
-        Ok::<_, anyhow::Error>(libraries)
+        Ok::<_, anyhow::Error>(browse::fetch_libraries(&client, visible.as_deref()).await?)
     })
+}
+
+/// Apply a visibility filter (and ordering) to `user_views`. `None` is a passthrough.
+pub(crate) fn order_views(
+    views: Vec<api::models::BaseItemDto>,
+    visible: Option<&[String]>,
+) -> Vec<api::models::BaseItemDto> {
+    let Some(visible) = visible else {
+        return views;
+    };
+    let mut by_id: std::collections::HashMap<String, api::models::BaseItemDto> =
+        views.into_iter().map(|v| (v.id.clone(), v)).collect();
+    visible.iter().filter_map(|id| by_id.remove(id)).collect()
 }
 
 

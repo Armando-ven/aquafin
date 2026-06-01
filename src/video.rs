@@ -102,17 +102,59 @@ impl Drop for VideoSession {
     }
 }
 
+/// Per-launch overrides for mpv: audio track + subtitle track. `None` lets mpv
+/// pick its default. [`TrackChoice`] encodes "no flag", "explicit pick", or
+/// "disable" (subs only).
+#[derive(Debug, Clone, Default)]
+pub struct VideoOptions {
+    pub audio: Option<TrackChoice>,
+    pub subtitle: Option<TrackChoice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackChoice {
+    /// Let mpv pick the default (no `--aid` / `--sid` flag).
+    Auto,
+    /// Disable the track (`--sid=no`; only meaningful for subtitles).
+    Off,
+    /// Explicit 1-based per-type track index.
+    Pick(i32),
+}
+
+impl TrackChoice {
+    fn as_arg(self) -> Option<String> {
+        match self {
+            TrackChoice::Auto => None,
+            TrackChoice::Off => Some("no".to_string()),
+            TrackChoice::Pick(n) => Some(n.to_string()),
+        }
+    }
+}
+
 /// Launch mpv on `stream_url`, returning the session once the process is spawned.
 /// mpv opens its own window; we never block the UI thread on it.
-pub fn spawn(stream_url: &str, item_id: &str, title: &str) -> Result<VideoSession, VideoError> {
+pub fn spawn(
+    stream_url: &str,
+    item_id: &str,
+    title: &str,
+    options: VideoOptions,
+) -> Result<VideoSession, VideoError> {
     let socket_path = socket_path_for(item_id);
 
-    let child = Command::new("mpv")
+    let mut command = Command::new("mpv");
+    command
         .arg(format!("--input-ipc-server={}", socket_path.display()))
         .arg("--force-window=yes")
         .arg("--osc=yes")
         .arg("--no-terminal")
-        .arg(format!("--force-media-title={title}"))
+        .arg(format!("--force-media-title={title}"));
+    if let Some(aid) = options.audio.and_then(TrackChoice::as_arg) {
+        command.arg(format!("--aid={aid}"));
+    }
+    if let Some(sid) = options.subtitle.and_then(TrackChoice::as_arg) {
+        command.arg(format!("--sid={sid}"));
+    }
+    let child = command
         .arg(stream_url)
         // Detach from our stdio so mpv can't scribble over the TUI.
         .stdin(Stdio::null())

@@ -9,7 +9,9 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::theme::Theme;
-use crate::ui::app::Level;
+use crate::ui::app::{
+    options_cursor_positions, Level, MediaOptionsCursor, MediaOptionsViewState,
+};
 
 pub fn render(
     frame: &mut Frame,
@@ -80,6 +82,91 @@ fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, t
     let mut state = ListState::default();
     state.select(Some(level.selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Pre-play media options for a video item: version + audio + subtitles +
+/// Play. The cursor sits on one selectable row at a time; Enter on a track
+/// row commits it; Enter on Play kicks off mpv with the chosen options.
+pub fn render_media_options(
+    frame: &mut Frame,
+    area: Rect,
+    view: &MediaOptionsViewState,
+    focused: bool,
+    theme: &Theme,
+) {
+    let block = Block::bordered()
+        .title(format!(" {} — Play options ", view.item_name))
+        .border_style(theme.border(focused));
+    if view.loading {
+        frame.render_widget(
+            Paragraph::new("Loading playback info…")
+                .style(theme.muted())
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let positions = options_cursor_positions(view);
+    let cursor_index = positions.iter().position(|c| *c == view.cursor).unwrap_or(0);
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut row_to_cursor: Vec<Option<usize>> = Vec::new();
+
+    // Version section (only shown when there's more than one).
+    if view.versions.len() > 1 {
+        items.push(section_header("Version", theme));
+        row_to_cursor.push(None);
+        for (i, v) in view.versions.iter().enumerate() {
+            let marker = if i == view.selected_version { "●" } else { "○" };
+            items.push(ListItem::new(format!("  {marker}  {}", v.label)));
+            row_to_cursor.push(positions.iter().position(|c| *c == MediaOptionsCursor::Version(i)));
+        }
+    }
+
+    items.push(section_header("Audio", theme));
+    row_to_cursor.push(None);
+    for (i, e) in view.audio_entries.iter().enumerate() {
+        let marker = if i == view.selected_audio { "●" } else { "○" };
+        items.push(ListItem::new(format!("  {marker}  {}", e.label)));
+        row_to_cursor.push(positions.iter().position(|c| *c == MediaOptionsCursor::Audio(i)));
+    }
+
+    items.push(section_header("Subtitles", theme));
+    row_to_cursor.push(None);
+    for (i, e) in view.subtitle_entries.iter().enumerate() {
+        let marker = if i == view.selected_subtitle { "●" } else { "○" };
+        items.push(ListItem::new(format!("  {marker}  {}", e.label)));
+        row_to_cursor.push(positions.iter().position(|c| *c == MediaOptionsCursor::Subtitle(i)));
+    }
+
+    items.push(ListItem::new(""));
+    row_to_cursor.push(None);
+    items.push(ListItem::new("  ▶  Play").style(theme.header()));
+    row_to_cursor.push(positions.iter().position(|c| matches!(c, MediaOptionsCursor::Play)));
+    if !view.trailer_urls.is_empty() {
+        items.push(ListItem::new("  ▶  Watch trailer").style(theme.header()));
+        row_to_cursor
+            .push(positions.iter().position(|c| matches!(c, MediaOptionsCursor::WatchTrailer)));
+    }
+
+    let row = row_to_cursor
+        .iter()
+        .position(|c| matches!(c, Some(i) if *i == cursor_index));
+
+    let list = List::new(items)
+        .block(block)
+        .style(theme.list_item())
+        .highlight_style(theme.selected_item(focused))
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    state.select(row);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn section_header(title: &str, theme: &Theme) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(title.to_string(), theme.header())))
 }
 
 /// Jellyfin `RunTimeTicks` (100 ns units) → a short `1h 56m` / `42m` string.
