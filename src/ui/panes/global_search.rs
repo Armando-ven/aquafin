@@ -29,8 +29,8 @@ pub fn render(
 
     let [header, input, hint, results] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(0),
     ])
     .areas(inner);

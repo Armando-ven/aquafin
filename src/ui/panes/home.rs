@@ -60,11 +60,13 @@ pub fn render(
         return;
     }
     if rows.is_empty() {
-        let placeholder = Paragraph::new(Line::from(vec![Span::styled(
-            "  Nothing here yet. Press 1 to open your first library.",
-            theme.muted(),
-        )]))
-        .alignment(Alignment::Left);
+        let msg = if home.recent_per_library.is_empty() {
+            "  No libraries yet. Run `aquafin --setup` to connect a server."
+        } else {
+            "  Nothing to show yet. Pick a library with the digit keys."
+        };
+        let placeholder = Paragraph::new(Line::from(vec![Span::styled(msg, theme.muted())]))
+            .alignment(Alignment::Left);
         frame.render_widget(placeholder, rest);
         return;
     }
@@ -301,72 +303,32 @@ fn render_tile(
         label_area,
     );
 
-    if let Some(progress_area) = Some(Rect {
+    let extra_area = Rect {
         x: area.x,
         y: area.y + area.height + 1,
         width: area.width,
         height: 1,
-    }) {
-        match kind {
-            HomeRowKind::Resume => {
-                let pct = progress_of(item).unwrap_or(0.0);
-                let bar = progress_bar(area.width as usize, pct);
-                frame.render_widget(
-                    Paragraph::new(Span::styled(bar, accent(theme))),
-                    progress_area,
-                );
-            }
-            HomeRowKind::NextUp => {
-                let line = item
-                    .overview
-                    .as_deref()
-                    .map(|o| clip(o, area.width as usize))
-                    .unwrap_or_else(|| "—".to_string());
-                frame.render_widget(
-                    Paragraph::new(Span::styled(line, theme.muted())),
-                    progress_area,
-                );
-            }
-            HomeRowKind::Libraries | HomeRowKind::Recent => {
-                let meta = item
-                    .production_year
-                    .map(|y| y.to_string())
-                    .unwrap_or_default();
-                if !meta.is_empty() {
-                    frame.render_widget(
-                        Paragraph::new(Span::styled(meta, theme.muted())),
-                        progress_area,
-                    );
-                }
-            }
-        }
+    };
+    let extra = match kind {
+        HomeRowKind::Resume => format_duration(item.run_time_ticks)
+            .map(|d| format!("⏱  {d}"))
+            .unwrap_or_default(),
+        HomeRowKind::NextUp => item
+            .overview
+            .as_deref()
+            .map(|o| clip(o, area.width as usize))
+            .unwrap_or_default(),
+        HomeRowKind::Libraries | HomeRowKind::Recent => item
+            .production_year
+            .map(|y| y.to_string())
+            .unwrap_or_default(),
+    };
+    if !extra.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(extra, theme.muted())),
+            extra_area,
+        );
     }
-}
-
-/// Approximate progress fraction (0.0..1.0) from `run_time_ticks` and the
-/// playback-position note in `Item::overview`. Items don't carry user-data
-/// directly in the UI Item, so we degrade gracefully when there's no signal.
-fn progress_of(item: &Item) -> Option<f32> {
-    // We don't currently surface playback_position_ticks on Item; treat resume
-    // entries as ~25% to at least draw a non-empty bar (still useful as a hint).
-    let _ = item.run_time_ticks?;
-    Some(0.25)
-}
-
-fn progress_bar(width: usize, pct: f32) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let filled = ((pct.clamp(0.0, 1.0) * width as f32).round() as usize).min(width);
-    let mut s = String::with_capacity(width);
-    for i in 0..width {
-        if i < filled {
-            s.push('▓');
-        } else {
-            s.push('░');
-        }
-    }
-    s
 }
 
 fn glyph_for(kind: HomeRowKind, item_kind: Option<&str>) -> &'static str {

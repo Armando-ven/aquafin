@@ -3316,21 +3316,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
             theme,
         );
         render_status(frame, regions.status, app);
-        if let Some(message) = &app.error {
-            let log_location = crate::paths::state_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            error_modal::render(
-                frame,
-                area,
-                message,
-                &log_location,
-                app.error_copied,
-                theme,
-            );
-        } else if app.show_help {
-            cheatsheet::render(frame, area, &app.keymap, theme);
-        }
+        render_overlays(frame, area, app, theme);
         return;
     }
 
@@ -3356,23 +3342,7 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
             theme,
         );
         render_status(frame, regions.status, app);
-        if let Some(message) = &app.error {
-            let log_location = crate::paths::state_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            error_modal::render(
-                frame,
-                area,
-                message,
-                &log_location,
-                app.error_copied,
-                theme,
-            );
-        } else if let Some((names, selected)) = app.theme_picker() {
-            theme_picker::render(frame, area, names, selected, theme.name(), theme);
-        } else if app.show_help {
-            cheatsheet::render(frame, area, &app.keymap, theme);
-        }
+        render_overlays(frame, area, app, theme);
         return;
     }
 
@@ -3457,6 +3427,14 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
 
     render_status(frame, regions.status, app);
 
+    render_overlays(frame, area, app, theme);
+}
+
+/// Render any overlay that sits on top of the main content (error modal,
+/// theme picker, library/playlist/video-track pickers, popup menu, help
+/// cheatsheet). Shared by every top-level view so opening a popup from Home
+/// or Search still renders.
+fn render_overlays(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if let Some(message) = &app.error {
         let log_location = crate::paths::state_dir()
             .map(|p| p.display().to_string())
@@ -3609,7 +3587,7 @@ fn render_playlist_picker_data(picker: &PlaylistPickerState) -> (&'static str, V
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if app.awaiting_go_to() {
-        let line = " Go to: t Top · i Items · s Sections · c Content · n Info · l Lyrics · q Queue · / Search · h Help · Esc cancel ";
+        let line = " Go to: h Home · s Search · t Top · i Items · c Content · n Info · l Lyrics · q Queue · ? Help · Esc cancel ";
         frame.render_widget(Paragraph::new(line).style(app.theme.header()), area);
         return;
     }
@@ -3626,10 +3604,21 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     // A transient note (e.g. "Not playable") takes over the left side when set.
     let left = match &app.status_message {
         Some(message) => format!(" {message} "),
-        None => {
-            let item = app.current_item().map_or("-", |i| i.name.as_str());
-            format!(" {focus_name}  ·  {}  ·  {item} ", app.breadcrumb())
-        }
+        None => match app.focus {
+            Pane::Home => " Home  ·  dashboard ".to_string(),
+            Pane::GlobalSearch => {
+                let q = app.global_search_state().query.clone();
+                if q.is_empty() {
+                    " Search  ·  global ".to_string()
+                } else {
+                    format!(" Search  ·  global  ·  \"{q}\" ")
+                }
+            }
+            _ => {
+                let item = app.current_item().map_or("-", |i| i.name.as_str());
+                format!(" {focus_name}  ·  {}  ·  {item} ", app.breadcrumb())
+            }
+        },
     };
     let hint = " Enter open/play · Bksp back · g go to · F1 help · q quit ";
 
