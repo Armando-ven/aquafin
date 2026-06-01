@@ -12,7 +12,8 @@ use crate::api::models::ItemsQuery;
 use crate::api::JellyfinClient;
 
 use super::app::{
-    App, Intent, Item, Library, MediaKind, MediaVersion, Section, TrackPickerEntry, VideoTrackKind,
+    App, HomeData, HomeLibrarySummary, Intent, Item, Library, MediaKind, MediaVersion, Section,
+    TrackPickerEntry, VideoTrackKind,
 };
 use crate::video::TrackChoice;
 
@@ -29,6 +30,11 @@ enum BrowseResult {
     },
     Search {
         library_id: String,
+        query: String,
+        items: Vec<Item>,
+    },
+    /// Server-wide search results — fed into the global-search view.
+    GlobalSearch {
         query: String,
         items: Vec<Item>,
     },
@@ -60,6 +66,8 @@ enum BrowseResult {
     Status(String),
     /// Server action failed — surface via the error modal.
     Error(String),
+    /// Home dashboard payload (resume + next-up + recents per library).
+    Home(HomeData),
 }
 
 pub struct Browser {
@@ -129,19 +137,25 @@ impl Browser {
         });
     }
 
-    /// Run a search via `/Search/Hints`. Results replace the active library's
-    /// root level.
+    /// Library-scoped search: runs an `Items` query with `parentId` +
+    /// `searchTerm` (recursive) so results stay within the current library.
+    /// Results replace the active library's root level.
     pub fn search(&mut self, library_id: String, query: String) {
         let client = self.client.clone();
         let tx = self.tx.clone();
         self.rt.spawn(async move {
-            let result = match client.search_hints(&query).await {
-                Ok(hints) => {
-                    let items = hints
-                        .search_hints
-                        .into_iter()
-                        .filter_map(item_from_hint)
-                        .collect();
+            let q = ItemsQuery {
+                parent_id: Some(library_id.clone()),
+                search_term: Some(query.clone()),
+                recursive: Some(true),
+                sort_by: vec!["SortName".to_string()],
+                fields: vec!["Overview".to_string()],
+                limit: Some(200),
+                ..Default::default()
+            };
+            let result = match client.items(&q).await {
+                Ok(list) => {
+                    let items = list.items.into_iter().map(super::item_from_dto).collect();
                     BrowseResult::Search {
                         library_id,
                         query,
@@ -152,6 +166,27 @@ impl Browser {
                     id: library_id,
                     message: format!("Couldn't search: {e}"),
                 },
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Server-wide search (the `g s` view). Uses `/Search/Hints` so every
+    /// library is covered in one round trip.
+    pub fn global_search(&mut self, query: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.search_hints(&query).await {
+                Ok(hints) => {
+                    let items = hints
+                        .search_hints
+                        .into_iter()
+                        .filter_map(item_from_hint)
+                        .collect();
+                    BrowseResult::GlobalSearch { query, items }
+                }
+                Err(e) => BrowseResult::Error(format!("Search failed: {e}")),
             };
             let _ = tx.send(result);
         });
@@ -323,6 +358,71 @@ impl Browser {
         });
     }
 
+    /// Fetch the Home dashboard payload in parallel: resume items, next-up,
+    /// and the latest items per library (best-effort — each section degrades
+    /// to empty on error so a single endpoint failing doesn't blank Home).
+    pub fn load_home(&mut self, libraries: Vec<(String, String, Option<String>)>) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let resume_fut = client.resume_items();
+            let next_up_fut = client.next_up(20);
+            let (resume_res, next_up_res) = tokio::join!(resume_fut, next_up_fut);
+
+            let resume: Vec<Item> = match resume_res {
+                Ok(r) => r.items.into_iter().map(super::item_from_dto).collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "home: resume_items failed");
+                    Vec::new()
+                }
+            };
+            let next_up: Vec<Item> = match next_up_res {
+                Ok(r) => r.items.into_iter().map(super::item_from_dto).collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "home: next_up failed");
+                    Vec::new()
+                }
+            };
+
+            let mut summaries: Vec<HomeLibrarySummary> = Vec::with_capacity(libraries.len());
+            for (id, name, collection_type) in libraries {
+                let recent = match client.latest_items(&id, 16).await {
+                    Ok(items) => items.into_iter().map(super::item_from_dto).collect(),
+                    Err(e) => {
+                        tracing::warn!(library = %id, error = %e, "home: latest_items failed");
+                        Vec::new()
+                    }
+                };
+                // Best-effort total count; "1" limit + total_record_count gives
+                // the library size without pulling every item.
+                let item_count = client
+                    .items(&crate::api::models::ItemsQuery {
+                        parent_id: Some(id.clone()),
+                        recursive: Some(true),
+                        limit: Some(1),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|r| r.total_record_count)
+                    .unwrap_or(0);
+                summaries.push(HomeLibrarySummary {
+                    id,
+                    name,
+                    collection_type,
+                    item_count,
+                    recent,
+                });
+            }
+
+            let _ = tx.send(BrowseResult::Home(HomeData {
+                resume,
+                next_up,
+                recent_per_library: summaries,
+                loading: false,
+            }));
+        });
+    }
+
     /// Record a dislike (`POST /UserItems/{id}/Rating?likes=false`).
     pub fn dislike(&mut self, item_id: String) {
         let client = self.client.clone();
@@ -388,6 +488,10 @@ impl Browser {
                 }
                 BrowseResult::Status(message) => app.set_status(message),
                 BrowseResult::Error(message) => app.show_error(message),
+                BrowseResult::Home(data) => app.set_home_data(data),
+                BrowseResult::GlobalSearch { query, items } => {
+                    app.set_global_search_results(&query, items);
+                }
             }
         }
     }

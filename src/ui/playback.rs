@@ -150,7 +150,9 @@ impl Playback {
             | Intent::Dislike { .. }
             | Intent::CopyItemUrl { .. }
             | Intent::LoadVideoTracks { .. }
-            | Intent::LoadMediaOptions { .. } => {}
+            | Intent::LoadMediaOptions { .. }
+            | Intent::LoadHome
+            | Intent::GlobalSearch { .. } => {}
         }
     }
 

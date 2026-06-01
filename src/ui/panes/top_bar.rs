@@ -22,6 +22,8 @@ pub fn render(
     selected: usize,
     search_query: Option<&str>,
     focused: bool,
+    home_active: bool,
+    global_search_active: bool,
     theme: &Theme,
 ) {
     let block = Block::bordered().border_style(theme.border(focused));
@@ -38,7 +40,15 @@ pub fn render(
     ])
     .areas(inner);
 
-    render_tabs(frame, tabs_area, libraries, selected, theme);
+    render_tabs(
+        frame,
+        tabs_area,
+        libraries,
+        selected,
+        home_active,
+        global_search_active,
+        theme,
+    );
     render_search(frame, search_area, search_query, theme);
 }
 
@@ -47,20 +57,40 @@ fn render_tabs(
     area: Rect,
     libraries: &[Library],
     selected: usize,
+    home_active: bool,
+    global_search_active: bool,
     theme: &Theme,
 ) {
-    let mut spans: Vec<Span> = Vec::with_capacity(libraries.len() * 4);
+    let mut spans: Vec<Span> = Vec::with_capacity(libraries.len() * 4 + 4);
+    // The Home chip leads the bar. Its keybind is `g h`; the hint chip
+    // displays the chord so users can find it without a cheatsheet hop.
+    spans.push(Span::styled(" ⌂ ", theme.folder_marker()));
+    spans.push(Span::raw(" "));
+    let home_style = if home_active {
+        theme.selected_item(true)
+    } else {
+        theme.list_item()
+    };
+    spans.push(Span::styled("Home", home_style));
+    // Global search chip (own tab). Reached via `g s`; no numeric chip.
+    spans.push(Span::styled(DOT, theme.muted()));
+    spans.push(Span::styled(" ⌕ ", theme.folder_marker()));
+    spans.push(Span::raw(" "));
+    let search_style = if global_search_active {
+        theme.selected_item(true)
+    } else {
+        theme.list_item()
+    };
+    spans.push(Span::styled("Search", search_style));
     for (index, library) in libraries.iter().enumerate().take(9) {
-        if index > 0 {
-            spans.push(Span::styled(DOT, theme.muted()));
-        }
+        spans.push(Span::styled(DOT, theme.muted()));
         // The numeric chip ("1", "2", …) doubles as the keybind hint.
         spans.push(Span::styled(
             format!(" {} ", index + 1),
             theme.folder_marker(),
         ));
         spans.push(Span::raw(" "));
-        let name_style = if index == selected {
+        let name_style = if !home_active && !global_search_active && index == selected {
             theme.selected_item(true)
         } else {
             theme.list_item()

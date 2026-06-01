@@ -27,6 +27,13 @@ pub(crate) type Tui = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     TopBar,
+    /// Home view (welcome strip + carousels + library tiles). Takes over the
+    /// full main area; when focused, navigation hands off to the home
+    /// pane's row/column cursor.
+    Home,
+    /// Global search view: own input + flat result list across every library.
+    /// Opened via `g s`. Like Home, takes over the full main area.
+    GlobalSearch,
     LibraryItems,
     LibrarySections,
     Content,
@@ -68,6 +75,72 @@ impl MediaKind {
             _ => MediaKind::Other,
         }
     }
+}
+
+/// Kind of a Home dashboard row. Drives which icon + accent + activation
+/// semantics the renderer uses for each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeRowKind {
+    Resume,
+    NextUp,
+    Libraries,
+    Recent,
+}
+
+/// One horizontal row on the Home dashboard. `library_id` is set on
+/// `Recent`/`Libraries` rows for tile activation; `Resume`/`NextUp` rows
+/// span every library.
+#[derive(Debug, Clone)]
+pub struct HomeRow {
+    pub kind: HomeRowKind,
+    pub title: String,
+    pub library_id: Option<String>,
+    pub items: Vec<Item>,
+}
+
+/// Server-fetched dashboard payload that drives the Home view.
+#[derive(Debug, Clone, Default)]
+pub struct HomeData {
+    pub resume: Vec<Item>,
+    pub next_up: Vec<Item>,
+    /// `(library_id, name, collection_type, count_label, recent_items)`. One
+    /// tuple per visible library, in the same order as `App::libraries`.
+    pub recent_per_library: Vec<HomeLibrarySummary>,
+    /// True until the first fetch lands (lets the renderer show a "Loading…"
+    /// placeholder instead of "Empty").
+    pub loading: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct HomeLibrarySummary {
+    pub id: String,
+    pub name: String,
+    pub collection_type: Option<String>,
+    pub item_count: i64,
+    pub recent: Vec<Item>,
+}
+
+/// Cursor on the Home dashboard. `row` indexes into the dashboard's row list
+/// (skipping any row that's empty); `col` indexes into that row's items.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HomeCursor {
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Global search view state: in-progress query + the most recent results.
+/// `input_focused` drives whether typing edits the query or moves the result
+/// cursor (Up from the first row returns focus to the input).
+#[derive(Debug, Clone, Default)]
+pub struct GlobalSearchState {
+    pub query: String,
+    pub results: Vec<Item>,
+    pub loading: bool,
+    pub selected: usize,
+    pub input_focused: bool,
+    /// Set once the user has submitted at least one query so the renderer can
+    /// distinguish "no results yet" from "no matches".
+    pub submitted: bool,
 }
 
 /// A side effect requested by the user that the event loop performs (handling
@@ -150,6 +223,12 @@ pub enum Intent {
     LoadMediaOptions { item_id: String },
     /// Launch mpv on an external trailer URL.
     WatchTrailer { url: String, title: String },
+    /// Fetch the Home dashboard payload (resume + next-up + per-library
+    /// recents). Driven on startup and on manual sync.
+    LoadHome,
+    /// Run a server-wide search across every library (the `g s` view). The
+    /// scoped, library-only search uses `Intent::Search` instead.
+    GlobalSearch { query: String },
 }
 
 /// Which popup menu, if any, is open.
@@ -644,6 +723,14 @@ pub struct App {
     error: Option<String>,
     error_copied: bool,
     keymap: Keymap,
+    /// Home dashboard payload (resume + next-up + recents per library).
+    home: HomeData,
+    /// Row/col cursor on Home. Lives separately from `focus` so leaving and
+    /// returning to Home preserves the user's spot.
+    home_cursor: HomeCursor,
+    /// Global search view state. Lives in App so the query + last results
+    /// survive leaving and re-entering the view.
+    global_search: GlobalSearchState,
 }
 
 impl Default for App {
@@ -732,6 +819,365 @@ impl App {
             error: None,
             error_copied: false,
             keymap: Keymap::default(),
+            home: HomeData::default(),
+            home_cursor: HomeCursor::default(),
+            global_search: GlobalSearchState {
+                input_focused: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Open the global search view. Lifts every overlay; the input regains
+    /// focus so the user can type immediately.
+    pub fn enter_global_search(&mut self) {
+        self.focus = Pane::GlobalSearch;
+        self.popup = None;
+        self.library_picker = None;
+        self.playlist_picker = None;
+        self.video_track_picker = None;
+        self.media_options_view = None;
+        self.theme_picker = None;
+        self.show_help = false;
+        self.global_search.input_focused = true;
+        self.status_message = None;
+    }
+
+    pub fn is_on_global_search(&self) -> bool {
+        self.focus == Pane::GlobalSearch
+    }
+
+    pub fn global_search_state(&self) -> &GlobalSearchState {
+        &self.global_search
+    }
+
+    /// Populate the global-search result list (called by Browser on completion).
+    pub fn set_global_search_results(&mut self, query: &str, results: Vec<Item>) {
+        if self.global_search.query.trim() != query {
+            return;
+        }
+        self.global_search.results = results;
+        self.global_search.loading = false;
+        self.global_search.submitted = true;
+        self.global_search.selected = 0;
+        // After results land, drop focus into the list so Up/Down navigate.
+        if !self.global_search.results.is_empty() {
+            self.global_search.input_focused = false;
+        }
+    }
+
+    fn submit_global_search(&mut self) {
+        let q = self.global_search.query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.global_search.loading = true;
+        self.global_search.results.clear();
+        self.pending.push(Intent::GlobalSearch { query: q });
+    }
+
+    fn handle_global_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                // Leave the view; return to Home unless the user came from a
+                // library, in which case fall back to the items pane.
+                self.focus = if self.libraries.is_empty() {
+                    Pane::Home
+                } else {
+                    Pane::LibraryItems
+                };
+            }
+            KeyCode::Enter => {
+                if self.global_search.input_focused {
+                    self.submit_global_search();
+                } else if let Some(item) = self
+                    .global_search
+                    .results
+                    .get(self.global_search.selected)
+                    .cloned()
+                {
+                    self.activate_global_search_item(item);
+                }
+            }
+            KeyCode::Up => {
+                if self.global_search.input_focused {
+                    return;
+                }
+                if self.global_search.selected == 0 {
+                    self.global_search.input_focused = true;
+                } else {
+                    self.global_search.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.global_search.input_focused {
+                    if !self.global_search.results.is_empty() {
+                        self.global_search.input_focused = false;
+                    }
+                    return;
+                }
+                let max = self.global_search.results.len().saturating_sub(1);
+                if self.global_search.selected < max {
+                    self.global_search.selected += 1;
+                }
+            }
+            KeyCode::Tab => {
+                self.global_search.input_focused = !self.global_search.input_focused;
+            }
+            KeyCode::Backspace => {
+                if self.global_search.input_focused {
+                    self.global_search.query.pop();
+                }
+            }
+            KeyCode::Char(c) if self.global_search.input_focused
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.global_search.query.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn activate_global_search_item(&mut self, item: Item) {
+        if item.is_folder {
+            self.focus = Pane::LibraryItems;
+            self.drill_into(&item);
+            return;
+        }
+        match MediaKind::classify(item.kind.as_deref()) {
+            MediaKind::Video => {
+                self.focus = Pane::LibraryItems;
+                self.open_media_options_view(item);
+            }
+            MediaKind::Audio => {
+                self.focus = Pane::LibraryItems;
+                self.pending.push(Intent::Play {
+                    item,
+                    media: MediaKind::Audio,
+                });
+            }
+            MediaKind::Other => {
+                self.status_message = Some(format!("Not playable: {}", item.name));
+            }
+        }
+    }
+
+    /// Focus the Home dashboard. Used at startup and when `g h` is pressed.
+    /// Also kicks a `LoadHome` so the loop refreshes the payload.
+    pub fn enter_home(&mut self) {
+        self.focus = Pane::Home;
+        self.popup = None;
+        self.library_picker = None;
+        self.playlist_picker = None;
+        self.video_track_picker = None;
+        self.media_options_view = None;
+        self.theme_picker = None;
+        self.show_help = false;
+        if !self.home.loading && self.home.resume.is_empty()
+            && self.home.next_up.is_empty()
+            && self.home.recent_per_library.is_empty()
+        {
+            self.home.loading = true;
+            self.pending.push(Intent::LoadHome);
+        }
+    }
+
+    /// Start the app on Home and queue the first dashboard fetch.
+    pub fn with_home_start(mut self) -> Self {
+        self.focus = Pane::Home;
+        self.home.loading = true;
+        self.pending.push(Intent::LoadHome);
+        self
+    }
+
+    pub fn is_on_home(&self) -> bool {
+        self.focus == Pane::Home
+    }
+
+    pub fn home_data(&self) -> &HomeData {
+        &self.home
+    }
+
+    pub fn home_cursor(&self) -> HomeCursor {
+        self.home_cursor
+    }
+
+    /// Build the visible Home rows. Rows with no items are dropped so the
+    /// cursor can never land on emptiness. `Libraries` is always shown so the
+    /// user has a non-empty target on a fresh install.
+    pub fn home_rows(&self) -> Vec<HomeRow> {
+        let mut rows: Vec<HomeRow> = Vec::new();
+        if !self.home.resume.is_empty() {
+            rows.push(HomeRow {
+                kind: HomeRowKind::Resume,
+                title: "Continue".to_string(),
+                library_id: None,
+                items: self.home.resume.clone(),
+            });
+        }
+        if !self.home.next_up.is_empty() {
+            rows.push(HomeRow {
+                kind: HomeRowKind::NextUp,
+                title: "Next Up".to_string(),
+                library_id: None,
+                items: self.home.next_up.clone(),
+            });
+        }
+        // Libraries row: synthesised from the library list itself, so each
+        // library appears as a tile whether or not we have any "recent" art.
+        let library_tiles: Vec<Item> = self
+            .libraries
+            .iter()
+            .map(|lib| Item {
+                id: lib.id.clone(),
+                name: lib.name.clone(),
+                is_folder: true,
+                // Carry the collection type as the item's kind so the Home
+                // renderer can pick a per-library glyph (▣ for movies, ♪ for
+                // music, …). MediaKind::classify still returns Other so
+                // activation routes through the Libraries-row branch.
+                kind: lib.collection_type.clone(),
+                primary_image_tag: self
+                    .home
+                    .recent_per_library
+                    .iter()
+                    .find(|s| s.id == lib.id)
+                    .and_then(|s| s.recent.first())
+                    .and_then(|i| i.primary_image_tag.clone()),
+                ..Default::default()
+            })
+            .collect();
+        if !library_tiles.is_empty() {
+            rows.push(HomeRow {
+                kind: HomeRowKind::Libraries,
+                title: "Libraries".to_string(),
+                library_id: None,
+                items: library_tiles,
+            });
+        }
+        for summary in &self.home.recent_per_library {
+            if summary.recent.is_empty() {
+                continue;
+            }
+            rows.push(HomeRow {
+                kind: HomeRowKind::Recent,
+                title: format!("New in {}", summary.name),
+                library_id: Some(summary.id.clone()),
+                items: summary.recent.clone(),
+            });
+        }
+        rows
+    }
+
+    /// Replace the home payload (called by the Browser when fetch completes).
+    pub fn set_home_data(&mut self, data: HomeData) {
+        self.home = data;
+        self.home.loading = false;
+        let rows = self.home_rows();
+        if self.home_cursor.row >= rows.len() {
+            self.home_cursor = HomeCursor::default();
+        } else if let Some(row) = rows.get(self.home_cursor.row) {
+            if self.home_cursor.col >= row.items.len() {
+                self.home_cursor.col = row.items.len().saturating_sub(1);
+            }
+        }
+    }
+
+    fn move_home_cursor(&mut self, drow: i32, dcol: i32) {
+        let rows = self.home_rows();
+        if rows.is_empty() {
+            return;
+        }
+        if drow != 0 {
+            let next = (self.home_cursor.row as i32 + drow)
+                .clamp(0, rows.len() as i32 - 1) as usize;
+            self.home_cursor.row = next;
+            // Clamp column into the new row.
+            let row_len = rows[next].items.len().max(1);
+            if self.home_cursor.col >= row_len {
+                self.home_cursor.col = row_len - 1;
+            }
+        }
+        if dcol != 0 {
+            let row_len = rows[self.home_cursor.row].items.len();
+            if row_len == 0 {
+                return;
+            }
+            let next = (self.home_cursor.col as i32 + dcol)
+                .clamp(0, row_len as i32 - 1) as usize;
+            self.home_cursor.col = next;
+        }
+    }
+
+    fn home_top(&mut self) {
+        let rows = self.home_rows();
+        if rows.is_empty() {
+            return;
+        }
+        self.home_cursor.col = 0;
+    }
+
+    fn home_bottom(&mut self) {
+        let rows = self.home_rows();
+        if let Some(row) = rows.get(self.home_cursor.row) {
+            if !row.items.is_empty() {
+                self.home_cursor.col = row.items.len() - 1;
+            }
+        }
+    }
+
+    /// Resolve the focused Home tile. Returns `(row_kind, library_id, item)`.
+    pub fn home_focused(&self) -> Option<(HomeRowKind, Option<String>, Item)> {
+        let rows = self.home_rows();
+        let row = rows.get(self.home_cursor.row)?;
+        let item = row.items.get(self.home_cursor.col)?.clone();
+        Some((row.kind, row.library_id.clone(), item))
+    }
+
+    /// Enter on a Home tile: library tiles jump to that library (and leave
+    /// Home), other tiles play / drill the item.
+    fn activate_home(&mut self) {
+        let Some((kind, _library_id, item)) = self.home_focused() else {
+            return;
+        };
+        match kind {
+            HomeRowKind::Libraries => {
+                if let Some(index) = self.libraries.iter().position(|l| l.id == item.id) {
+                    self.library_selected = index;
+                    self.reset_stack_for_library();
+                    self.focus = Pane::LibraryItems;
+                    if let Some(library) = self.current_library() {
+                        let id = library.id.clone();
+                        self.pending.push(Intent::SaveLastLibrary(id));
+                    }
+                }
+            }
+            _ => {
+                if item.is_folder {
+                    // Drill into a series/album/etc. Find the library it
+                    // belongs to so the right side panes have context.
+                    self.focus = Pane::LibraryItems;
+                    self.drill_into(&item);
+                    return;
+                }
+                match MediaKind::classify(item.kind.as_deref()) {
+                    MediaKind::Video => {
+                        self.focus = Pane::LibraryItems;
+                        self.open_media_options_view(item);
+                    }
+                    MediaKind::Audio => {
+                        self.focus = Pane::LibraryItems;
+                        self.pending.push(Intent::Play {
+                            item,
+                            media: MediaKind::Audio,
+                        });
+                    }
+                    MediaKind::Other => {
+                        self.status_message =
+                            Some(format!("Not playable: {}", item.name));
+                    }
+                }
+            }
         }
     }
 
@@ -1287,6 +1733,13 @@ impl App {
             return;
         }
 
+        // Global search owns input while focused (own query buffer + result
+        // list). Esc leaves; Enter submits or activates a result.
+        if self.focus == Pane::GlobalSearch {
+            self.handle_global_search_key(key);
+            return;
+        }
+
         // The theme picker captures input while open.
         if let Some(selected) = self.theme_picker {
             match key.code {
@@ -1329,11 +1782,18 @@ impl App {
         }
 
         // Top-bar library switch: digit 1..9 picks library N (no modifiers).
+        // From Home, the digit also drops focus into the chosen library.
         if let KeyCode::Char(c) = key.code {
             if key.modifiers.is_empty() && c.is_ascii_digit() && c != '0' {
                 let index = (c as u8 - b'1') as usize;
-                self.status_message = None;
-                self.select_library(index);
+                if index < self.libraries.len() {
+                    self.status_message = None;
+                    let came_from_home = self.focus == Pane::Home;
+                    self.select_library(index);
+                    if came_from_home {
+                        self.focus = Pane::LibraryItems;
+                    }
+                }
                 return;
             }
         }
@@ -1344,6 +1804,23 @@ impl App {
 
         // A new keypress clears any transient status note from the last one.
         self.status_message = None;
+
+        // Home dashboard owns navigation while focused. The non-nav actions
+        // (play/pause, volume, themes, …) still flow through the normal path
+        // so global hotkeys keep working from Home.
+        if self.focus == Pane::Home {
+            match action {
+                Action::Up => { self.move_home_cursor(-1, 0); return; }
+                Action::Down => { self.move_home_cursor(1, 0); return; }
+                Action::Left => { self.move_home_cursor(0, -1); return; }
+                Action::Right => { self.move_home_cursor(0, 1); return; }
+                Action::Top => { self.home_top(); return; }
+                Action::Bottom => { self.home_bottom(); return; }
+                Action::Play => { self.activate_home(); return; }
+                Action::Back => { self.focus = Pane::TopBar; return; }
+                _ => {}
+            }
+        }
 
         match action {
             Action::Quit => self.should_quit = true,
@@ -1390,7 +1867,7 @@ impl App {
         // media-options view, the help overlay).
         if matches!(
             key.code,
-            KeyCode::Char('t' | 'i' | 's' | 'c' | 'n' | 'l' | 'q' | '/' | 'h')
+            KeyCode::Char('t' | 'i' | 's' | 'c' | 'n' | 'l' | 'q' | 'h')
         ) {
             self.popup = None;
             self.library_picker = None;
@@ -1403,7 +1880,7 @@ impl App {
         match key.code {
             KeyCode::Char('t') => self.focus = Pane::TopBar,
             KeyCode::Char('i') => self.focus = Pane::LibraryItems,
-            KeyCode::Char('s') => self.focus = Pane::LibrarySections,
+            KeyCode::Char('s') => self.enter_global_search(),
             KeyCode::Char('c') => self.focus = Pane::Content,
             KeyCode::Char('n') => {
                 self.focus = Pane::ContextTop;
@@ -1414,12 +1891,8 @@ impl App {
                 self.set_context_view(ContextTopView::Lyrics);
             }
             KeyCode::Char('q') => self.focus = Pane::ContextBottom,
-            KeyCode::Char('/') => {
-                self.search_query = Some(String::new());
-                self.focus = Pane::TopBar;
-                self.status_message = None;
-            }
-            KeyCode::Char('h') => self.show_help = true,
+            KeyCode::Char('h') => self.enter_home(),
+            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -2334,6 +2807,8 @@ impl App {
             Pane::ContextTop => self.scroll_focused_context(1),
             Pane::ContextBottom => self.scroll_focused_context(1),
             Pane::TopBar => {}
+            Pane::Home => self.move_home_cursor(1, 0),
+            Pane::GlobalSearch => {}
         }
     }
 
@@ -2358,6 +2833,8 @@ impl App {
             Pane::ContextTop => self.scroll_focused_context(-1),
             Pane::ContextBottom => self.scroll_focused_context(-1),
             Pane::TopBar => {}
+            Pane::Home => self.move_home_cursor(-1, 0),
+            Pane::GlobalSearch => {}
         }
     }
 
@@ -2412,6 +2889,8 @@ impl App {
             Pane::Content => Pane::ContextTop,
             Pane::ContextTop => Pane::ContextBottom,
             Pane::ContextBottom => Pane::ContextBottom,
+            Pane::Home => Pane::Home,
+            Pane::GlobalSearch => Pane::GlobalSearch,
         };
     }
 
@@ -2432,6 +2911,8 @@ impl App {
             Pane::Content => Pane::LibrarySections,
             Pane::LibrarySections => Pane::LibraryItems,
             Pane::LibraryItems | Pane::TopBar => Pane::LibraryItems,
+            Pane::Home => Pane::Home,
+            Pane::GlobalSearch => Pane::GlobalSearch,
         };
     }
 
@@ -2697,6 +3178,21 @@ pub(crate) fn run_browser(
                         br.load_media_options(item_id);
                     }
                 }
+                Intent::LoadHome => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        let libs: Vec<(String, String, Option<String>)> = app
+                            .libraries
+                            .iter()
+                            .map(|l| (l.id.clone(), l.name.clone(), l.collection_type.clone()))
+                            .collect();
+                        br.load_home(libs);
+                    }
+                }
+                Intent::GlobalSearch { query } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.global_search(query);
+                    }
+                }
                 other => {
                     if let Some(pb) = playback.as_deref_mut() {
                         pb.dispatch(other, app);
@@ -2798,8 +3294,87 @@ pub fn render(frame: &mut Frame, app: &App, mut images: Option<&mut super::image
         app.library_selected,
         app.search_query.as_deref(),
         app.focus == Pane::TopBar,
+        app.is_on_home(),
+        app.is_on_global_search(),
         theme,
     );
+
+    // Global search takes over the main area, like Home.
+    if app.is_on_global_search() {
+        panes::global_search::render(
+            frame,
+            regions.main,
+            app.global_search_state(),
+            app.focus == Pane::GlobalSearch,
+            theme,
+        );
+        super::now_playing::render(
+            frame,
+            regions.now_playing,
+            app.now_playing.as_ref(),
+            images,
+            theme,
+        );
+        render_status(frame, regions.status, app);
+        if let Some(message) = &app.error {
+            let log_location = crate::paths::state_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            error_modal::render(
+                frame,
+                area,
+                message,
+                &log_location,
+                app.error_copied,
+                theme,
+            );
+        } else if app.show_help {
+            cheatsheet::render(frame, area, &app.keymap, theme);
+        }
+        return;
+    }
+
+    // Home takes over the full main band; the right-side context panes and
+    // middle content pane don't render in this mode.
+    if app.is_on_home() {
+        let rows = app.home_rows();
+        panes::home::render(
+            frame,
+            regions.main,
+            app.home_data(),
+            &rows,
+            app.home_cursor(),
+            None,
+            app.focus == Pane::Home,
+            theme,
+        );
+        super::now_playing::render(
+            frame,
+            regions.now_playing,
+            app.now_playing.as_ref(),
+            images,
+            theme,
+        );
+        render_status(frame, regions.status, app);
+        if let Some(message) = &app.error {
+            let log_location = crate::paths::state_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            error_modal::render(
+                frame,
+                area,
+                message,
+                &log_location,
+                app.error_copied,
+                theme,
+            );
+        } else if let Some((names, selected)) = app.theme_picker() {
+            theme_picker::render(frame, area, names, selected, theme.name(), theme);
+        } else if app.show_help {
+            cheatsheet::render(frame, area, &app.keymap, theme);
+        }
+        return;
+    }
 
     let root_level = app.root_level();
     let root_title = root_level.map(|l| l.title.clone()).unwrap_or_default();
@@ -3045,6 +3620,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         Pane::Content => "Details",
         Pane::ContextTop => "Context",
         Pane::ContextBottom => "Queue",
+        Pane::Home => "Home",
+        Pane::GlobalSearch => "Search",
     };
     // A transient note (e.g. "Not playable") takes over the left side when set.
     let left = match &app.status_message {
@@ -4539,12 +5116,12 @@ mod tests {
     #[test]
     fn go_to_prefix_then_target_changes_focus() {
         let mut app = App::new();
-        // g + s → Sections pane
+        // g + i → Items pane
         app.handle_key(press(KeyCode::Char('g')));
         assert!(app.awaiting_go_to());
-        app.handle_key(press(KeyCode::Char('s')));
+        app.handle_key(press(KeyCode::Char('i')));
         assert!(!app.awaiting_go_to());
-        assert_eq!(app.focus, Pane::LibrarySections);
+        assert_eq!(app.focus, Pane::LibraryItems);
         // g + t → Top bar (libraries)
         app.handle_key(press(KeyCode::Char('g')));
         app.handle_key(press(KeyCode::Char('t')));
@@ -4567,12 +5144,44 @@ mod tests {
     }
 
     #[test]
-    fn go_to_slash_opens_search() {
+    fn go_to_s_opens_global_search() {
         let mut app = App::new();
         app.handle_key(press(KeyCode::Char('g')));
+        app.handle_key(press(KeyCode::Char('s')));
+        assert_eq!(app.focus, Pane::GlobalSearch);
+        assert!(app.global_search_state().input_focused);
+    }
+
+    #[test]
+    fn slash_opens_library_scoped_search() {
+        let mut app = App::new();
         app.handle_key(press(KeyCode::Char('/')));
         assert_eq!(app.focus, Pane::TopBar);
         assert!(app.search_query.is_some());
+    }
+
+    #[test]
+    fn global_search_input_typing_appends_query() {
+        let mut app = App::new();
+        app.enter_global_search();
+        app.handle_key(press(KeyCode::Char('m')));
+        app.handle_key(press(KeyCode::Char('x')));
+        assert_eq!(app.global_search_state().query, "mx");
+        app.handle_key(press(KeyCode::Backspace));
+        assert_eq!(app.global_search_state().query, "m");
+    }
+
+    #[test]
+    fn global_search_enter_emits_global_search_intent() {
+        let mut app = App::new();
+        app.enter_global_search();
+        app.handle_key(press(KeyCode::Char('a')));
+        app.handle_key(press(KeyCode::Enter));
+        let intents = app.take_intents();
+        assert!(intents.iter().any(|i| matches!(
+            i,
+            Intent::GlobalSearch { query } if query == "a"
+        )));
     }
 
     #[test]
@@ -4595,9 +5204,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
         assert!(app.popup_menu().is_some());
         app.handle_key(press(KeyCode::Char('g')));
-        app.handle_key(press(KeyCode::Char('s')));
+        app.handle_key(press(KeyCode::Char('i')));
         assert!(app.popup_menu().is_none());
-        assert_eq!(app.focus, Pane::LibrarySections);
+        assert_eq!(app.focus, Pane::LibraryItems);
     }
 
     #[test]

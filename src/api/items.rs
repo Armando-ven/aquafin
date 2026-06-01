@@ -38,6 +38,32 @@ impl JellyfinClient {
         .await
     }
 
+    /// `GET /Users/{userId}/Items/Latest` — recently added items under
+    /// `parent_id` (a library view). Useful for the Home "New in …" rows.
+    pub async fn latest_items(
+        &self,
+        parent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<BaseItemDto>> {
+        let path = format!("/Users/{}/Items/Latest", self.user_id());
+        self.send_json(self.get(&path).query(&[
+            ("parentId", parent_id.to_string()),
+            ("limit", limit.to_string()),
+            ("fields", "Overview".to_string()),
+        ]))
+        .await
+    }
+
+    /// `GET /Shows/NextUp` — next unwatched episode of in-progress series.
+    pub async fn next_up(&self, limit: u32) -> Result<ItemsResult> {
+        self.send_json(self.get("/Shows/NextUp").query(&[
+            ("userId", self.user_id().to_string()),
+            ("limit", limit.to_string()),
+            ("fields", "Overview".to_string()),
+        ]))
+        .await
+    }
+
     /// `GET /Search/Hints` — quick search suggestions.
     pub async fn search_hints(&self, search_term: &str) -> Result<SearchHintResult> {
         self.send_json(self.get("/Search/Hints").query(&[

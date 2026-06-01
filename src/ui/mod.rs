@@ -96,7 +96,8 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
         .with_audio_prefs(config.audio.repeat_mode.into(), config.audio.shuffle)
         .with_section_memory(config.ui.section_memory.clone())
         .with_last_library(config.ui.last_library_id.clone())
-        .with_search_history(config.ui.search_history.clone());
+        .with_search_history(config.ui.search_history.clone())
+        .with_home_start();
     if let Some(error) = startup_error {
         app.show_error(error);
     } else if !warnings.is_empty() {

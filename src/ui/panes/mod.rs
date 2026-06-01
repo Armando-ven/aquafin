@@ -3,6 +3,8 @@
 
 pub mod content;
 pub mod context_pane;
+pub mod global_search;
+pub mod home;
 pub mod library_items;
 pub mod library_sections;
 pub mod top_bar;

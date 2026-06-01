@@ -92,7 +92,7 @@ const ACTIONS: &[ActionSpec] = &[
     ActionSpec { action: Action::InfoScrollUp, name: "info_scroll_up", default_keys: "pageup", desc: "Scroll info pane up", group: "General" },
     ActionSpec { action: Action::InfoScrollDown, name: "info_scroll_down", default_keys: "pagedown", desc: "Scroll info pane down", group: "General" },
     ActionSpec { action: Action::Help, name: "help", default_keys: "f1", desc: "Toggle help", group: "General" },
-    ActionSpec { action: Action::GoTo, name: "go_to", default_keys: "g", desc: "Go to… (then i/s/c/t/n/l/q/// h)", group: "General" },
+    ActionSpec { action: Action::GoTo, name: "go_to", default_keys: "g", desc: "Go to… (h home · s global search · i/c/t/n/l/q · ? help). `/` searches inside the current library.", group: "General" },
     ActionSpec { action: Action::Cancel, name: "cancel", default_keys: "esc", desc: "Close overlay / cancel", group: "General" },
     ActionSpec { action: Action::Quit, name: "quit", default_keys: "q", desc: "Quit", group: "General" },
 ];

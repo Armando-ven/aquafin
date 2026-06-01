@@ -14,6 +14,9 @@ pub const TOP_BAR_HEIGHT: u16 = 3;
 
 pub struct Regions {
     pub top_bar: Rect,
+    /// The full main band between the top bar and the now-playing strip.
+    /// Used by the Home dashboard, which takes over the whole area.
+    pub main: Rect,
     /// Left column, top 2/3: the active library's media.
     pub library_items: Rect,
     /// Left column, bottom 1/3: the library's sub-views (sections).
@@ -52,6 +55,7 @@ pub fn compute(area: Rect) -> Regions {
 
     Regions {
         top_bar,
+        main,
         library_items,
         library_sections,
         content: middle,
