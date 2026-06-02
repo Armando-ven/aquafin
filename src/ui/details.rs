@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use crate::api::models::ItemsQuery;
 use crate::api::JellyfinClient;
 
-use super::app::{App, ItemDetail, LyricLine, Person};
+use super::app::{App, Chapter, ItemDetail, LyricLine, Person};
 
 /// One completed detail fetch. The `id` lets the UI ignore stale responses
 /// after the selection has moved on.
@@ -107,6 +107,7 @@ pub(crate) async fn fetch_detail(
         .unwrap_or_default()
         .into_iter()
         .map(|p| Person {
+            id: p.id,
             name: p.name.unwrap_or_default(),
             role: p.role,
             kind: p.type_,
@@ -159,6 +160,20 @@ pub(crate) async fn fetch_detail(
         .into_iter()
         .filter_map(|t| t.url.filter(|u| !u.is_empty()))
         .collect();
+    let chapters = item
+        .chapters
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| Chapter {
+            name: c
+                .name
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Chapter {}", i + 1)),
+            start_position_ticks: c.start_position_ticks.unwrap_or(0),
+        })
+        .collect();
     Some(ItemDetail {
         overview: item.overview.clone(),
         cast,
@@ -169,6 +184,7 @@ pub(crate) async fn fetch_detail(
         artist_albums,
         appears_on,
         trailer_urls,
+        chapters,
     })
 }
 

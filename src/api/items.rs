@@ -23,10 +23,14 @@ impl JellyfinClient {
     }
 
     /// `GET /Items/{itemId}` — full detail for a single item (user-scoped).
+    /// Requests `fields=Chapters` so chapter markers ride along on detail loads.
     pub async fn item(&self, item_id: &str) -> Result<BaseItemDto> {
         let path = format!("/Items/{item_id}");
-        self.send_json(self.get(&path).query(&[("userId", self.user_id())]))
-            .await
+        self.send_json(
+            self.get(&path)
+                .query(&[("userId", self.user_id()), ("fields", "Chapters")]),
+        )
+        .await
     }
 
     /// `GET /UserItems/Resume` — Continue Watching.
@@ -84,6 +88,17 @@ impl JellyfinClient {
         self.send_no_content(self.request(method, &path)).await
     }
 
+    /// `POST` or `DELETE /Users/{userId}/PlayedItems/{itemId}` — mark played/unplayed.
+    pub async fn set_played(&self, item_id: &str, played: bool) -> Result<()> {
+        let path = format!("/Users/{}/PlayedItems/{}", self.user_id(), item_id);
+        let method = if played {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::DELETE
+        };
+        self.send_no_content(self.request(method, &path)).await
+    }
+
     /// `GET /Audio/{itemId}/Lyrics` — synced or plain-text lyrics for an audio
     /// item. Errors when the server has no lyrics for the track.
     pub async fn lyrics(&self, item_id: &str) -> Result<LyricsDto> {
@@ -107,6 +122,25 @@ impl JellyfinClient {
                 .query(&[("userId", self.user_id()), ("limit", &limit.to_string())]),
         )
         .await
+    }
+
+    /// `POST /Playlists` — create a playlist owned by the current user. Returns
+    /// the new playlist id.
+    pub async fn create_playlist(&self, name: &str, item_ids: &[String]) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct CreatePlaylistResponse {
+            id: String,
+        }
+        let path = "/Playlists";
+        let result: CreatePlaylistResponse = self
+            .send_json(self.post(path).query(&[
+                ("Name", name.to_string()),
+                ("UserId", self.user_id().to_string()),
+                ("Ids", item_ids.join(",")),
+            ]))
+            .await?;
+        Ok(result.id)
     }
 
     /// `POST /Playlists/{playlistId}/Items` — append items to a playlist.

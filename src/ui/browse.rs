@@ -13,6 +13,7 @@ use crate::api::JellyfinClient;
 
 use super::app::{
     App, HomeData, HomeLibrarySummary, Intent, Item, Library, MediaKind, MediaVersion, Section,
+    SectionFilters,
     TrackPickerEntry, VideoTrackKind,
 };
 use crate::video::TrackChoice;
@@ -117,12 +118,18 @@ impl Browser {
     }
 
     /// Refetch the library's root level with a section filter applied.
-    pub fn apply_section(&mut self, library_id: String, library_name: String, section: Section) {
+    pub fn apply_section(
+        &mut self,
+        library_id: String,
+        library_name: String,
+        section: Section,
+        extras: SectionFilters,
+    ) {
         let client = self.client.clone();
         let tx = self.tx.clone();
         let title = format!("{library_name} · {}", section.name);
         self.rt.spawn(async move {
-            let result = match fetch_section_items(&client, &library_id, &section).await {
+            let result = match fetch_section_items(&client, &library_id, &section, &extras).await {
                 Ok(items) => BrowseResult::Section {
                     library_id,
                     title,
@@ -272,6 +279,57 @@ impl Browser {
         });
     }
 
+    /// Build a "genre radio" queue: pull a random batch of audio items
+    /// matching `genre` (recursive in `library_id`).
+    pub fn genre_radio(&mut self, library_id: String, genre: String) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let q = crate::api::models::ItemsQuery {
+                parent_id: Some(library_id),
+                include_item_types: vec!["Audio".to_string()],
+                genres: vec![genre],
+                sort_by: vec!["Random".to_string()],
+                recursive: Some(true),
+                limit: Some(50),
+                fields: vec!["Overview".to_string()],
+                ..Default::default()
+            };
+            let result = match client.items(&q).await {
+                Ok(list) => {
+                    let items: Vec<Item> = list
+                        .items
+                        .into_iter()
+                        .map(super::item_from_dto)
+                        .filter(|i| {
+                            matches!(MediaKind::classify(i.kind.as_deref()), MediaKind::Audio)
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        BrowseResult::Error("Genre radio returned no tracks".to_string())
+                    } else {
+                        BrowseResult::InstantMix(items)
+                    }
+                }
+                Err(e) => BrowseResult::Error(format!("Genre radio failed: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Create a server-side playlist named `name` with the supplied items.
+    pub fn create_playlist(&mut self, name: String, item_ids: Vec<String>) {
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let result = match client.create_playlist(&name, &item_ids).await {
+                Ok(id) => BrowseResult::Status(format!("Saved as playlist \"{name}\" ({id})")),
+                Err(e) => BrowseResult::Error(format!("Couldn't save playlist: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
     /// Fetch the Instant Mix queue for `item`.
     pub fn instant_mix(&mut self, item: Item) {
         let client = self.client.clone();
@@ -367,7 +425,21 @@ impl Browser {
         self.rt.spawn(async move {
             let resume_fut = client.resume_items();
             let next_up_fut = client.next_up(20);
-            let (resume_res, next_up_res) = tokio::join!(resume_fut, next_up_fut);
+            let latest_query = crate::api::models::ItemsQuery {
+                recursive: Some(true),
+                sort_by: vec!["DateCreated".to_string()],
+                limit: Some(20),
+                include_item_types: vec![
+                    "Movie".to_string(),
+                    "Series".to_string(),
+                    "MusicAlbum".to_string(),
+                ],
+                fields: vec!["Overview".to_string()],
+                ..Default::default()
+            };
+            let latest_fut = client.items(&latest_query);
+            let (resume_res, next_up_res, latest_res) =
+                tokio::join!(resume_fut, next_up_fut, latest_fut);
 
             let resume: Vec<Item> = match resume_res {
                 Ok(r) => r.items.into_iter().map(super::item_from_dto).collect(),
@@ -380,6 +452,13 @@ impl Browser {
                 Ok(r) => r.items.into_iter().map(super::item_from_dto).collect(),
                 Err(e) => {
                     tracing::warn!(error = %e, "home: next_up failed");
+                    Vec::new()
+                }
+            };
+            let latest_global: Vec<Item> = match latest_res {
+                Ok(r) => r.items.into_iter().map(super::item_from_dto).collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "home: global latest failed");
                     Vec::new()
                 }
             };
@@ -418,6 +497,7 @@ impl Browser {
                 resume,
                 next_up,
                 recent_per_library: summaries,
+                latest_global,
                 loading: false,
             }));
         });
@@ -647,16 +727,32 @@ pub(crate) async fn fetch_section_items(
     client: &crate::api::JellyfinClient,
     library_id: &str,
     section: &Section,
+    extras: &SectionFilters,
 ) -> crate::api::Result<Vec<Item>> {
+    // Runtime filters that force a wider search (recursive) when set even on
+    // sections that would otherwise only show the immediate root level.
+    let extras_force_recursive = !extras.genres.is_empty()
+        || !extras.person_ids.is_empty()
+        || !extras.studio_ids.is_empty()
+        || !extras.years.is_empty()
+        || !extras.tags.is_empty()
+        || !extras.filters.is_empty();
     let query = ItemsQuery {
         parent_id: Some(library_id.to_string()),
         include_item_types: section.item_types.clone(),
-        sort_by: section.sort_by.clone(),
-        // Recursive only when there's a type filter; without one we're showing
-        // the library's direct top-level items.
-        recursive: Some(!section.item_types.is_empty()),
+        sort_by: extras
+            .sort_override
+            .clone()
+            .unwrap_or_else(|| section.sort_by.clone()),
+        recursive: Some(!section.item_types.is_empty() || extras_force_recursive),
         fields: vec!["Overview".to_string()],
         limit: Some(500),
+        genres: extras.genres.clone(),
+        person_ids: extras.person_ids.clone(),
+        studio_ids: extras.studio_ids.clone(),
+        years: extras.years.clone(),
+        tags: extras.tags.clone(),
+        filters: extras.filters.clone(),
         ..Default::default()
     };
     let result = client.items(&query).await?;
@@ -711,9 +807,14 @@ mod tests {
             item_types: vec!["MusicAlbum".to_string()],
             sort_by: vec!["SortName".to_string()],
         };
-        let items = fetch_section_items(&client_for(&server).await, "lib1", &section)
-            .await
-            .unwrap();
+        let items = fetch_section_items(
+            &client_for(&server).await,
+            "lib1",
+            &section,
+            &SectionFilters::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].name, "Discovery");
         assert_eq!(items[0].id, "a1");
@@ -740,9 +841,14 @@ mod tests {
             item_types: Vec::new(),
             sort_by: vec!["SortName".to_string()],
         };
-        let items = fetch_section_items(&client_for(&server).await, "lib1", &section)
-            .await
-            .unwrap();
+        let items = fetch_section_items(
+            &client_for(&server).await,
+            "lib1",
+            &section,
+            &SectionFilters::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(items[0].name, "Root");
     }
 

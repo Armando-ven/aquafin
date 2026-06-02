@@ -150,6 +150,19 @@ pub fn render_media_options(
             .push(positions.iter().position(|c| matches!(c, MediaOptionsCursor::WatchTrailer)));
     }
 
+    if !view.chapters.is_empty() {
+        items.push(ListItem::new(""));
+        row_to_cursor.push(None);
+        items.push(section_header("Chapters", theme));
+        row_to_cursor.push(None);
+        for (i, c) in view.chapters.iter().enumerate() {
+            let stamp = format_chapter_timestamp(c.start_position_ticks);
+            items.push(ListItem::new(format!("  ▶  {stamp}  {}", c.name)));
+            row_to_cursor
+                .push(positions.iter().position(|p| *p == MediaOptionsCursor::Chapter(i)));
+        }
+    }
+
     let row = row_to_cursor
         .iter()
         .position(|c| matches!(c, Some(i) if *i == cursor_index));
@@ -163,6 +176,17 @@ pub fn render_media_options(
     let mut state = ListState::default();
     state.select(row);
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Convert Jellyfin ticks to `h:mm:ss` / `m:ss` for chapter rows.
+fn format_chapter_timestamp(ticks: i64) -> String {
+    let total_secs = (ticks.max(0) / 10_000_000) as u64;
+    let (h, m, s) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn section_header(title: &str, theme: &Theme) -> ListItem<'static> {

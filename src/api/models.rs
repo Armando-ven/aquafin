@@ -102,6 +102,22 @@ pub struct BaseItemDto {
     /// the server has any.
     pub remote_trailers: Option<Vec<MediaUrl>>,
     pub local_trailer_count: Option<i32>,
+    /// Chapter markers (movies, some episodes). Populated when `fields=Chapters`
+    /// is requested.
+    pub chapters: Option<Vec<ChapterInfo>>,
+    /// ReplayGain-style per-track normalization in dB (negative ⇒ attenuate).
+    /// Populated by Jellyfin when the source carries a `REPLAYGAIN_TRACK_GAIN` tag.
+    pub normalization_gain: Option<f32>,
+}
+
+/// One chapter marker on an item (a name + a timestamp into the file).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ChapterInfo {
+    pub name: Option<String>,
+    /// Start position, in Jellyfin 100 ns ticks.
+    pub start_position_ticks: Option<i64>,
+    pub image_tag: Option<String>,
 }
 
 /// A `{Url, Name}` pair from Jellyfin's `RemoteTrailers` field.
@@ -214,6 +230,19 @@ pub struct ItemsQuery {
     /// Filter to items whose contributing artists include one of these ids.
     /// Used for an artist's "appears on" list.
     pub artist_ids: Vec<String>,
+    /// Filter to items tagged with these genres (Jellyfin `genres` query param).
+    pub genres: Vec<String>,
+    /// Filter to items credited to one of these people (`personIds`). Used by
+    /// the "browse by person" / filmography flow.
+    pub person_ids: Vec<String>,
+    /// Filter to items whose studio matches one of these (`studioIds`).
+    pub studio_ids: Vec<String>,
+    /// Filter to items released in one of these years (`years` query param).
+    pub years: Vec<i32>,
+    /// Filter to items tagged with one of these tags (`tags`).
+    pub tags: Vec<String>,
+    /// Jellyfin `filters` query, comma-joined (e.g. `IsUnplayed,IsFavorite`).
+    pub filters: Vec<String>,
 }
 
 impl ItemsQuery {
@@ -249,6 +278,27 @@ impl ItemsQuery {
         }
         if !self.artist_ids.is_empty() {
             pairs.push(("artistIds", self.artist_ids.join(",")));
+        }
+        if !self.genres.is_empty() {
+            pairs.push(("genres", self.genres.join("|")));
+        }
+        if !self.person_ids.is_empty() {
+            pairs.push(("personIds", self.person_ids.join(",")));
+        }
+        if !self.studio_ids.is_empty() {
+            pairs.push(("studioIds", self.studio_ids.join(",")));
+        }
+        if !self.years.is_empty() {
+            pairs.push((
+                "years",
+                self.years.iter().map(|y| y.to_string()).collect::<Vec<_>>().join(","),
+            ));
+        }
+        if !self.tags.is_empty() {
+            pairs.push(("tags", self.tags.join("|")));
+        }
+        if !self.filters.is_empty() {
+            pairs.push(("filters", self.filters.join(",")));
         }
         pairs
     }

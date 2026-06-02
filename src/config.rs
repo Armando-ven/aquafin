@@ -20,6 +20,7 @@ pub struct Config {
     /// Action-name → key-string overrides (e.g. `down = "j, down"`).
     pub keymap: BTreeMap<String, String>,
     pub audio: AudioConfig,
+    pub video: VideoConfig,
     pub log: LogConfig,
 }
 
@@ -90,6 +91,42 @@ pub struct AudioConfig {
     /// Persisted shuffle on/off.
     #[serde(default)]
     pub shuffle: bool,
+    /// Gapless audio: pre-buffer the next queued track so the swap doesn't
+    /// introduce silence between tracks.
+    #[serde(default)]
+    pub gapless: bool,
+    /// Crossfade duration in seconds (0 = off). Mixes the tail of the current
+    /// track with the head of the next.
+    #[serde(default)]
+    pub crossfade_secs: u32,
+    /// Apply per-track `NormalizationGain` (ReplayGain) when the server provides it.
+    #[serde(default)]
+    pub normalization: bool,
+    #[serde(default)]
+    pub eq: EqConfig,
+}
+
+/// Three-band EQ with named presets. When `preset` is `Custom` the explicit
+/// dB fields apply; otherwise they're ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EqConfig {
+    pub enabled: bool,
+    pub preset: EqPreset,
+    pub bass_db: f32,
+    pub mid_db: f32,
+    pub treble_db: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EqPreset {
+    #[default]
+    Flat,
+    BassBoost,
+    Vocal,
+    TrebleBoost,
+    Custom,
 }
 
 /// Repeat-mode value as serialized to TOML. Kept separate from
@@ -111,8 +148,20 @@ impl Default for AudioConfig {
             seek_seconds: 5,
             repeat_mode: RepeatModePref::Off,
             shuffle: false,
+            gapless: false,
+            crossfade_secs: 0,
+            normalization: false,
+            eq: EqConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoConfig {
+    /// Extra args spliced into the `mpv` command line. Read from
+    /// `config.toml` under `[video] mpv_args = ["--vo=gpu", ...]`.
+    pub mpv_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

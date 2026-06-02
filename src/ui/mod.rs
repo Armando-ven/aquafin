@@ -94,6 +94,12 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
         .with_theme(theme)
         .with_available_themes(crate::theme::available_names())
         .with_audio_prefs(config.audio.repeat_mode.into(), config.audio.shuffle)
+        .with_audio_features(
+            config.audio.gapless,
+            config.audio.normalization,
+            config.audio.eq.preset,
+            config.video.mpv_args.len(),
+        )
         .with_section_memory(config.ui.section_memory.clone())
         .with_last_library(config.ui.last_library_id.clone())
         .with_search_history(config.ui.search_history.clone())
@@ -110,6 +116,13 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
     match client {
         Some(client) => {
             let audio = crate::audio::AudioEngine::new(config.audio.volume);
+            audio.set_normalization_enabled(config.audio.normalization);
+            audio.set_eq(match config.audio.eq.preset {
+                crate::config::EqPreset::BassBoost => Some(crate::audio::EqChoice::BassBoost),
+                crate::config::EqPreset::Vocal => Some(crate::audio::EqChoice::Vocal),
+                crate::config::EqPreset::TrebleBoost => Some(crate::audio::EqChoice::TrebleBoost),
+                crate::config::EqPreset::Flat | crate::config::EqPreset::Custom => None,
+            });
             let mut browser = browse::Browser::new(runtime.handle().clone(), client.clone());
             let mut images =
                 images::Images::new(runtime.handle().clone(), client.clone(), config.ui.image_protocol);
@@ -120,6 +133,8 @@ fn orchestrate(terminal: &mut app::Tui, runtime: &tokio::runtime::Runtime, setup
                 audio,
                 config.audio.seek_seconds,
             );
+            player.set_mpv_args(config.video.mpv_args.clone());
+            player.set_gapless(config.audio.gapless);
             let result = app::run_browser(
                 terminal,
                 &mut app,
@@ -185,6 +200,11 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         .as_ref()
         .and_then(|u| u.is_favorite)
         .unwrap_or(false);
+    let is_played = dto
+        .user_data
+        .as_ref()
+        .and_then(|u| u.played)
+        .unwrap_or(false);
     app::Item {
         is_folder: dto.is_folder.unwrap_or(false),
         id: dto.id,
@@ -195,6 +215,8 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         kind: dto.type_,
         primary_image_tag,
         is_favorite,
+        is_played,
+        normalization_gain_db: dto.normalization_gain,
     }
 }
 

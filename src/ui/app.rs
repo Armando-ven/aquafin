@@ -42,7 +42,7 @@ pub enum Pane {
 }
 
 /// A library item (movie, episode, album, …) with the fields the detail pane shows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Item {
     pub id: String,
     pub name: String,
@@ -55,6 +55,9 @@ pub struct Item {
     /// as opposed to a playable leaf.
     pub is_folder: bool,
     pub is_favorite: bool,
+    pub is_played: bool,
+    /// ReplayGain-style per-track normalization in dB, when the server carries it.
+    pub normalization_gain_db: Option<f32>,
 }
 
 /// How an item plays back: video opens in mpv, audio plays in-app, everything
@@ -106,6 +109,9 @@ pub struct HomeData {
     /// `(library_id, name, collection_type, count_label, recent_items)`. One
     /// tuple per visible library, in the same order as `App::libraries`.
     pub recent_per_library: Vec<HomeLibrarySummary>,
+    /// Latest items across every library (server-side `/Users/Items` recursive
+    /// query sorted by `DateCreated`). Drives the "Latest" row.
+    pub latest_global: Vec<Item>,
     /// True until the first fetch lands (lets the renderer show a "Loading…"
     /// placeholder instead of "Empty").
     pub loading: bool,
@@ -148,8 +154,9 @@ pub struct GlobalSearchState {
 /// [`App::take_intents`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
-    /// Play this item (already classified as Video or Audio).
-    Play { item: Item, media: MediaKind },
+    /// Play this item (already classified as Video or Audio). `start_ticks`
+    /// optionally overrides the start position (used for "play from chapter N").
+    Play { item: Item, media: MediaKind, start_ticks: Option<i64> },
     /// Load and drill into a folder's children (the loading level is already
     /// pushed; the loader fills it by `id`).
     OpenFolder { id: String, title: String },
@@ -164,11 +171,27 @@ pub enum Intent {
     /// Tell the server about a favorite-state change. The app already flipped
     /// the local item optimistically; this carries the desired remote state.
     SetFavorite { item_id: String, favorite: bool },
+    /// Tell the server about a played-state change (mirrors `SetFavorite`).
+    SetPlayed { item_id: String, played: bool },
+    /// Apply a sleep-timer choice (arms an absolute deadline or end-of-track stop).
+    SetSleepTimer(SleepTimer),
+    /// Build a queue of audio items matching `genre` inside `library_id` and
+    /// start playing. Handled by the browser.
+    GenreRadio { library_id: String, genre: String },
+    /// Create a server-side playlist named `name` carrying `item_ids`.
+    CreatePlaylist { name: String, item_ids: Vec<String> },
+    /// Toggle gapless audio (persisted + applied at the playback controller).
+    SetGapless(bool),
+    /// Toggle ReplayGain normalization (persisted + applied to the audio engine).
+    SetNormalization(bool),
+    /// Pick an EQ preset (persisted + applied to the audio engine).
+    SetEqPreset(crate::config::EqPreset),
     /// Refetch the library root level with this section's filter (Enter on a
     /// section). The library's drill stack is reset to a loading root level.
     ApplySection {
         library_id: String,
         section: Section,
+        extras: SectionFilters,
     },
     /// Run a search query (Enter inside the search input). Results replace the
     /// active library's root level via `apply_search_results`.
@@ -238,6 +261,8 @@ pub enum PopupMenu {
     Item(usize),
     /// Client settings (key: `Shift+P`).
     Client(usize),
+    /// Sleep-timer preset picker (opened from the item menu).
+    SleepTimer(usize),
 }
 
 /// Entries in the per-item actions popup. The popup is built dynamically per
@@ -248,6 +273,15 @@ pub enum ItemMenuAction {
     ShowLyrics,
     Play,
     ToggleFavorite,
+    TogglePlayed,
+    OpenSleepTimerPicker,
+    BrowseByGenre,
+    BrowseByPerson,
+    PlayNext,
+    AddToQueue,
+    SaveQueueAsPlaylist,
+    GenreRadio,
+    WatchTrailer,
     AddToPlaylist,
     InstantMix,
     Dislike,
@@ -316,6 +350,7 @@ pub enum MediaOptionsCursor {
     Version(usize),
     Audio(usize),
     Subtitle(usize),
+    Chapter(usize),
     Play,
     WatchTrailer,
 }
@@ -337,6 +372,9 @@ pub struct MediaOptionsViewState {
     /// External trailer URLs (mirrored from `ItemDetail.trailer_urls` once the
     /// detail fetch lands). Watch trailer row is shown when non-empty.
     pub trailer_urls: Vec<String>,
+    /// Chapter markers (mirrored from `ItemDetail.chapters`). Pressing Enter on
+    /// a chapter row launches mpv with `--start=<seconds>`.
+    pub chapters: Vec<Chapter>,
 }
 
 /// Which view the music top-right context pane is rendering.
@@ -354,6 +392,13 @@ pub enum ClientMenuAction {
     Themes,
     SyncNow,
     VisibleLibraries,
+    ToggleGapless,
+    ToggleNormalization,
+    CycleEqPreset,
+    ShowMpvArgs,
+    CycleSort,
+    ToggleUnplayed,
+    ClearFilters,
     Quit,
 }
 
@@ -436,14 +481,100 @@ impl Section {
     }
 }
 
+/// Runtime filter + sort overrides applied on top of a [`Section`]. Empty
+/// fields are no-ops; set fields merge into the items query.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SectionFilters {
+    pub genres: Vec<String>,
+    pub person_ids: Vec<String>,
+    pub years: Vec<i32>,
+    pub studio_ids: Vec<String>,
+    pub tags: Vec<String>,
+    /// Jellyfin `Filters` (e.g. `IsUnplayed`, `IsFavorite`).
+    pub filters: Vec<String>,
+    /// When set, overrides the section's `sort_by` order.
+    pub sort_override: Option<Vec<String>>,
+}
+
 /// Cast / crew member shown in the right-column context pane for movies/tv.
 #[derive(Debug, Clone, Default)]
 pub struct Person {
+    /// Jellyfin person id (used to filter items via `personIds=`).
+    pub id: Option<String>,
     pub name: String,
     /// e.g. `Neo`, `Director`, `Writer`. May be empty.
     pub role: Option<String>,
     /// Jellyfin `Type` (`Actor`, `Director`, `Writer`, `GuestStar`, …).
     pub kind: Option<String>,
+}
+
+/// Sleep timer choice. Cycles via the item-menu entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SleepTimer {
+    #[default]
+    Off,
+    In5,
+    In10,
+    In15,
+    In20,
+    In30,
+    In45,
+    In60,
+    In90,
+    In120,
+    /// Stop after the current track finishes (audio) or current item ends (video).
+    EndOfTrack,
+}
+
+impl SleepTimer {
+    /// Full preset list in picker-display order. `Off` first so it doubles as
+    /// "Cancel" when the timer is already armed.
+    pub const PRESETS: &'static [SleepTimer] = &[
+        SleepTimer::Off,
+        SleepTimer::In5,
+        SleepTimer::In10,
+        SleepTimer::In15,
+        SleepTimer::In20,
+        SleepTimer::In30,
+        SleepTimer::In45,
+        SleepTimer::In60,
+        SleepTimer::In90,
+        SleepTimer::In120,
+        SleepTimer::EndOfTrack,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SleepTimer::Off => "Off",
+            SleepTimer::In5 => "5 min",
+            SleepTimer::In10 => "10 min",
+            SleepTimer::In15 => "15 min",
+            SleepTimer::In20 => "20 min",
+            SleepTimer::In30 => "30 min",
+            SleepTimer::In45 => "45 min",
+            SleepTimer::In60 => "1 hour",
+            SleepTimer::In90 => "1h 30m",
+            SleepTimer::In120 => "2 hours",
+            SleepTimer::EndOfTrack => "End of track",
+        }
+    }
+
+    /// `Some(duration)` for absolute-time choices, `None` for Off / EndOfTrack.
+    pub fn duration(self) -> Option<std::time::Duration> {
+        let mins = match self {
+            SleepTimer::In5 => 5,
+            SleepTimer::In10 => 10,
+            SleepTimer::In15 => 15,
+            SleepTimer::In20 => 20,
+            SleepTimer::In30 => 30,
+            SleepTimer::In45 => 45,
+            SleepTimer::In60 => 60,
+            SleepTimer::In90 => 90,
+            SleepTimer::In120 => 120,
+            SleepTimer::Off | SleepTimer::EndOfTrack => return None,
+        };
+        Some(std::time::Duration::from_secs(mins * 60))
+    }
 }
 
 /// Queue repeat mode.
@@ -529,6 +660,17 @@ pub struct ItemDetail {
     pub appears_on: Vec<Item>,
     /// External trailer URLs (YouTube etc.) for the item.
     pub trailer_urls: Vec<String>,
+    /// Chapter markers from `BaseItemDto.Chapters`. Empty when the server
+    /// returned none (or the field was not requested).
+    pub chapters: Vec<Chapter>,
+}
+
+/// One chapter marker on a video item (name + position into the file).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chapter {
+    pub name: String,
+    /// 100 ns Jellyfin ticks into the item.
+    pub start_position_ticks: i64,
 }
 
 /// In-place Fisher-Yates shuffle backed by a tiny linear-congruential PRNG
@@ -563,23 +705,30 @@ pub fn sections_for(collection_type: Option<&str>) -> Vec<Section> {
             Section::new("Latest", &["Movie"], &["DateCreated"]),
             Section::new("Collections", &["BoxSet"], &["SortName"]),
             Section::new("Favorites", &["Movie"], &["SortName"]),
+            Section::new("Playlists", &["Playlist"], &["SortName"]),
         ],
         Some("tvshows") => vec![
             Section::new("All", &[], &["SortName"]),
             Section::new("Series", &["Series"], &["SortName"]),
             Section::new("Episodes", &["Episode"], &["DateCreated"]),
+            Section::new("Playlists", &["Playlist"], &["SortName"]),
         ],
         Some("books") => vec![
             Section::new("All", &[], &["SortName"]),
             Section::new("Books", &["Book"], &["SortName"]),
             Section::new("Authors", &["Person"], &["SortName"]),
+            Section::new("Playlists", &["Playlist"], &["SortName"]),
         ],
         Some("photos") => vec![
             Section::new("All", &[], &["SortName"]),
             Section::new("Albums", &["PhotoAlbum"], &["SortName"]),
             Section::new("Photos", &["Photo"], &["DateCreated"]),
+            Section::new("Playlists", &["Playlist"], &["SortName"]),
         ],
-        _ => vec![Section::new("All", &[], &["SortName"])],
+        _ => vec![
+            Section::new("All", &[], &["SortName"]),
+            Section::new("Playlists", &["Playlist"], &["SortName"]),
+        ],
     }
 }
 
@@ -662,6 +811,25 @@ pub struct App {
     /// audio is playing.
     pub queue_index: Option<usize>,
     pub repeat_mode: RepeatMode,
+    /// Current sleep-timer choice. Cycled via the item-menu entry; the playback
+    /// controller arms a real deadline when this changes.
+    pub sleep_timer: SleepTimer,
+    /// Seconds left on the timed sleep choice. Written each tick by the playback
+    /// controller and shown in the sleep-timer entry/picker. `None` for Off and
+    /// for `EndOfTrack` (which has no fixed deadline).
+    pub sleep_remaining_secs: Option<u64>,
+    /// Per-library runtime filter/sort overrides (cleared by toggling them off
+    /// in the client menu). Merged into the items query on each `ApplySection`.
+    pub section_filters: std::collections::HashMap<String, SectionFilters>,
+    /// Gapless audio toggle (mirrors `config.audio.gapless`).
+    pub gapless: bool,
+    /// ReplayGain normalization toggle (mirrors `config.audio.normalization`).
+    pub normalization: bool,
+    /// Current EQ preset (mirrors `config.audio.eq.preset`; `Flat` == disabled).
+    pub eq_preset: crate::config::EqPreset,
+    /// Number of custom mpv args from `config.video.mpv_args`. Display-only
+    /// here — editing happens by hand in `config.toml`.
+    pub mpv_arg_count: usize,
     /// True when shuffle is on. The queue list is reordered in place each time
     /// shuffle flips on (so the auto-advance pointer follows the new order).
     pub shuffle: bool,
@@ -793,6 +961,13 @@ impl App {
             queue: Vec::new(),
             queue_index: None,
             repeat_mode: RepeatMode::Off,
+            sleep_timer: SleepTimer::Off,
+            sleep_remaining_secs: None,
+            section_filters: std::collections::HashMap::new(),
+            gapless: false,
+            normalization: false,
+            eq_preset: crate::config::EqPreset::Flat,
+            mpv_arg_count: 0,
             shuffle: false,
             section_memory: std::collections::HashMap::new(),
             search_history: Vec::new(),
@@ -954,6 +1129,7 @@ impl App {
                 self.pending.push(Intent::Play {
                     item,
                     media: MediaKind::Audio,
+                    start_ticks: None,
                 });
             }
             MediaKind::Other => {
@@ -1021,6 +1197,14 @@ impl App {
                 title: "Next Up".to_string(),
                 library_id: None,
                 items: self.home.next_up.clone(),
+            });
+        }
+        if !self.home.latest_global.is_empty() {
+            rows.push(HomeRow {
+                kind: HomeRowKind::Recent,
+                title: "Latest".to_string(),
+                library_id: None,
+                items: self.home.latest_global.clone(),
             });
         }
         // Libraries row: synthesised from the library list itself, so each
@@ -1170,6 +1354,7 @@ impl App {
                         self.pending.push(Intent::Play {
                             item,
                             media: MediaKind::Audio,
+                            start_ticks: None,
                         });
                     }
                     MediaKind::Other => {
@@ -1204,6 +1389,22 @@ impl App {
     }
 
     /// Seed the queue mode + shuffle from persisted config.
+    /// Wire the persisted audio-feature toggles (gapless / normalization /
+    /// EQ preset) and the mpv-args count so the client menu reflects them.
+    pub fn with_audio_features(
+        mut self,
+        gapless: bool,
+        normalization: bool,
+        eq_preset: crate::config::EqPreset,
+        mpv_arg_count: usize,
+    ) -> Self {
+        self.gapless = gapless;
+        self.normalization = normalization;
+        self.eq_preset = eq_preset;
+        self.mpv_arg_count = mpv_arg_count;
+        self
+    }
+
     pub fn with_audio_prefs(mut self, repeat_mode: RepeatMode, shuffle: bool) -> Self {
         self.repeat_mode = repeat_mode;
         self.shuffle = shuffle;
@@ -1372,6 +1573,7 @@ impl App {
         if let Some(view) = self.media_options_view.as_mut() {
             if view.item_id == item_id {
                 view.trailer_urls = detail.trailer_urls.clone();
+                view.chapters = detail.chapters.clone();
             }
         }
         if self
@@ -1492,6 +1694,24 @@ impl App {
         self.queue_index = Some(start_index);
     }
 
+    /// Insert `item` right after the currently-playing track (Play next) or
+    /// at the queue tail (Add to queue). No-op when the queue is empty (the
+    /// caller already issues a normal Play in that case).
+    pub fn enqueue(&mut self, item: Item, play_next: bool) {
+        if self.queue.is_empty() {
+            self.queue.push(item);
+            self.queue_index = Some(0);
+            return;
+        }
+        if play_next {
+            let after = self.queue_index.map(|i| i + 1).unwrap_or(self.queue.len());
+            let pos = after.min(self.queue.len());
+            self.queue.insert(pos, item);
+        } else {
+            self.queue.push(item);
+        }
+    }
+
     /// Advance to the next track in the queue, honoring [`RepeatMode`].
     /// `None` when no further tracks remain (queue ends with repeat off).
     pub fn advance_queue(&mut self) -> Option<Item> {
@@ -1569,6 +1789,27 @@ impl App {
         self.queue_save_intent();
     }
 
+    /// Apply a sleep-timer choice picked from the overlay.
+    pub fn pick_sleep_timer(&mut self, choice: SleepTimer) {
+        self.sleep_timer = choice;
+        self.sleep_remaining_secs = None;
+        self.status_message = Some(match choice {
+            SleepTimer::Off => "Sleep timer off".to_string(),
+            SleepTimer::EndOfTrack => "Sleep timer: stop at end of track".to_string(),
+            other => format!("Sleep timer: {}", other.label()),
+        });
+        self.pending.push(Intent::SetSleepTimer(choice));
+    }
+
+    /// Open the sleep-timer overlay with the cursor on the active preset.
+    fn open_sleep_timer_picker(&mut self) {
+        let idx = SleepTimer::PRESETS
+            .iter()
+            .position(|p| *p == self.sleep_timer)
+            .unwrap_or(0);
+        self.popup = Some(PopupMenu::SleepTimer(idx));
+    }
+
     fn queue_save_intent(&mut self) {
         self.pending.push(Intent::SaveAudioPrefs {
             repeat_mode: self.repeat_mode,
@@ -1637,8 +1878,13 @@ impl App {
         // Fetch first (the primary action), then queue the save so the choice
         // survives restart.
         self.pending.push(Intent::ApplySection {
-            library_id: library.id,
+            library_id: library.id.clone(),
             section,
+            extras: self
+                .section_filters
+                .get(&library.id)
+                .cloned()
+                .unwrap_or_default(),
         });
         self.pending
             .push(Intent::SaveSectionMemory(self.section_memory.clone()));
@@ -2010,7 +2256,41 @@ impl App {
                     .collect();
                 Some(("Client settings", entries, selected))
             }
+            PopupMenu::SleepTimer(selected) => {
+                let entries = self
+                    .sleep_timer_entries()
+                    .into_iter()
+                    .map(|(label, _)| label)
+                    .collect();
+                Some(("Sleep timer", entries, selected))
+            }
         }
+    }
+
+    fn sleep_timer_entries(&self) -> Vec<(String, SleepTimer)> {
+        SleepTimer::PRESETS
+            .iter()
+            .map(|preset| {
+                let mut label = match preset {
+                    SleepTimer::Off => {
+                        if self.sleep_timer == SleepTimer::Off {
+                            "Off".to_string()
+                        } else {
+                            "Cancel timer".to_string()
+                        }
+                    }
+                    other => other.label().to_string(),
+                };
+                if *preset == self.sleep_timer {
+                    if let Some(secs) = self.sleep_remaining_secs {
+                        label.push_str(&format!("  · {} left", format_remaining(secs)));
+                    } else if *preset != SleepTimer::Off {
+                        label.push_str("  · active");
+                    }
+                }
+                (label, *preset)
+            })
+            .collect()
     }
 
     /// Entries shown in the per-item popup. Built from the focused item so the
@@ -2044,10 +2324,52 @@ impl App {
             "Add to favorites"
         };
         entries.push((fav_label.to_string(), ItemMenuAction::ToggleFavorite));
+        if playable {
+            let played_label = if item.is_played {
+                "Mark unplayed"
+            } else {
+                "Mark played"
+            };
+            entries.push((played_label.to_string(), ItemMenuAction::TogglePlayed));
+        }
+        if let Some(detail) = self.current_detail() {
+            if let Some(first_genre) = detail.genres.first() {
+                entries.push((
+                    format!("Browse by genre: {first_genre}"),
+                    ItemMenuAction::BrowseByGenre,
+                ));
+            }
+            if let Some(actor) = detail
+                .cast
+                .iter()
+                .find(|p| p.id.is_some() && !p.name.is_empty())
+            {
+                entries.push((
+                    format!("Browse by person: {}", actor.name),
+                    ItemMenuAction::BrowseByPerson,
+                ));
+            }
+        }
         entries.push(("Add to playlist…".to_string(), ItemMenuAction::AddToPlaylist));
         if is_audio {
+            entries.push(("Play next".to_string(), ItemMenuAction::PlayNext));
+            entries.push(("Add to queue".to_string(), ItemMenuAction::AddToQueue));
             entries.push(("Instant mix".to_string(), ItemMenuAction::InstantMix));
+            entries.push((
+                "Genre radio".to_string(),
+                ItemMenuAction::GenreRadio,
+            ));
+            entries.push((
+                "Save queue as playlist…".to_string(),
+                ItemMenuAction::SaveQueueAsPlaylist,
+            ));
             entries.push(("Dislike track".to_string(), ItemMenuAction::Dislike));
+        }
+        if self
+            .current_detail()
+            .is_some_and(|d| !d.trailer_urls.is_empty())
+        {
+            entries.push(("Watch trailer".to_string(), ItemMenuAction::WatchTrailer));
         }
         let is_video = matches!(
             MediaKind::classify(item.kind.as_deref()),
@@ -2077,6 +2399,10 @@ impl App {
             ItemMenuAction::CycleRepeat,
         ));
         entries.push((
+            sleep_timer_menu_label(self.sleep_timer, self.sleep_remaining_secs),
+            ItemMenuAction::OpenSleepTimerPicker,
+        ));
+        entries.push((
             "Copy URL to clipboard".to_string(),
             ItemMenuAction::CopyUrl,
         ));
@@ -2086,12 +2412,60 @@ impl App {
     /// Entries shown in the client-settings popup. Labels carry the current
     /// state so the user can see what they'd be toggling.
     fn client_menu_entries(&self) -> Vec<(String, ClientMenuAction)> {
+        let current_extras = self
+            .current_library()
+            .and_then(|l| self.section_filters.get(&l.id).cloned())
+            .unwrap_or_default();
+        let sort_label = current_extras
+            .sort_override
+            .as_ref()
+            .and_then(|s| s.first().cloned())
+            .unwrap_or_else(|| "Section default".to_string());
+        let unplayed_on = current_extras.filters.iter().any(|f| f == "IsUnplayed");
+        let any_filter = !current_extras.genres.is_empty()
+            || !current_extras.person_ids.is_empty()
+            || !current_extras.studio_ids.is_empty()
+            || !current_extras.years.is_empty()
+            || !current_extras.tags.is_empty()
+            || !current_extras.filters.is_empty()
+            || current_extras.sort_override.is_some();
         vec![
             ("Theme…".to_string(), ClientMenuAction::Themes),
             ("Sync with server now".to_string(), ClientMenuAction::SyncNow),
             (
                 "Visible libraries…".to_string(),
                 ClientMenuAction::VisibleLibraries,
+            ),
+            (
+                format!("Sort by: {sort_label}"),
+                ClientMenuAction::CycleSort,
+            ),
+            (
+                format!("Show only unplayed: {}", on_off(unplayed_on)),
+                ClientMenuAction::ToggleUnplayed,
+            ),
+            (
+                format!(
+                    "Clear filters ({})",
+                    if any_filter { "active" } else { "none" }
+                ),
+                ClientMenuAction::ClearFilters,
+            ),
+            (
+                format!("Gapless audio: {}", on_off(self.gapless)),
+                ClientMenuAction::ToggleGapless,
+            ),
+            (
+                format!("Volume normalization: {}", on_off(self.normalization)),
+                ClientMenuAction::ToggleNormalization,
+            ),
+            (
+                format!("EQ: {}", eq_preset_label(self.eq_preset)),
+                ClientMenuAction::CycleEqPreset,
+            ),
+            (
+                format!("Custom mpv args: {}", self.mpv_arg_count),
+                ClientMenuAction::ShowMpvArgs,
             ),
             ("Quit".to_string(), ClientMenuAction::Quit),
         ]
@@ -2114,13 +2488,14 @@ impl App {
         let len = match popup {
             PopupMenu::Item(_) => self.item_menu_entries().len(),
             PopupMenu::Client(_) => self.client_menu_entries().len(),
+            PopupMenu::SleepTimer(_) => self.sleep_timer_entries().len(),
         };
         if len == 0 {
             self.popup = None;
             return;
         }
         let selected = match popup {
-            PopupMenu::Item(i) | PopupMenu::Client(i) => i.min(len - 1),
+            PopupMenu::Item(i) | PopupMenu::Client(i) | PopupMenu::SleepTimer(i) => i.min(len - 1),
         };
         match key.code {
             KeyCode::Esc => self.popup = None,
@@ -2129,6 +2504,7 @@ impl App {
                 self.popup = Some(match popup {
                     PopupMenu::Item(_) => PopupMenu::Item(next),
                     PopupMenu::Client(_) => PopupMenu::Client(next),
+                    PopupMenu::SleepTimer(_) => PopupMenu::SleepTimer(next),
                 });
             }
             KeyCode::Down => {
@@ -2136,6 +2512,7 @@ impl App {
                 self.popup = Some(match popup {
                     PopupMenu::Item(_) => PopupMenu::Item(next),
                     PopupMenu::Client(_) => PopupMenu::Client(next),
+                    PopupMenu::SleepTimer(_) => PopupMenu::SleepTimer(next),
                 });
             }
             KeyCode::Enter => {
@@ -2153,6 +2530,13 @@ impl App {
                             self.client_menu_entries().into_iter().nth(selected)
                         {
                             self.activate_client_action(action);
+                        }
+                    }
+                    PopupMenu::SleepTimer(_) => {
+                        if let Some((_, choice)) =
+                            self.sleep_timer_entries().into_iter().nth(selected)
+                        {
+                            self.pick_sleep_timer(choice);
                         }
                     }
                 }
@@ -2186,6 +2570,14 @@ impl App {
             }
             ItemMenuAction::Play => self.activate(),
             ItemMenuAction::ToggleFavorite => self.toggle_favorite(),
+            ItemMenuAction::TogglePlayed => self.toggle_played(),
+            ItemMenuAction::BrowseByGenre => self.browse_by_first_genre(),
+            ItemMenuAction::BrowseByPerson => self.browse_by_first_person(),
+            ItemMenuAction::PlayNext => self.play_next_or_append(true),
+            ItemMenuAction::AddToQueue => self.play_next_or_append(false),
+            ItemMenuAction::GenreRadio => self.start_genre_radio(),
+            ItemMenuAction::SaveQueueAsPlaylist => self.save_queue_as_playlist(),
+            ItemMenuAction::WatchTrailer => self.watch_first_trailer(),
             ItemMenuAction::AddToPlaylist => self.open_playlist_picker(),
             ItemMenuAction::InstantMix => {
                 if let Some(item) = self.current_item().cloned() {
@@ -2203,6 +2595,7 @@ impl App {
             ItemMenuAction::Subtitles => self.open_video_track_picker(VideoTrackKind::Subtitle),
             ItemMenuAction::ToggleShuffle => self.toggle_shuffle(),
             ItemMenuAction::CycleRepeat => self.cycle_repeat(),
+            ItemMenuAction::OpenSleepTimerPicker => self.open_sleep_timer_picker(),
             ItemMenuAction::CopyUrl => {
                 if let Some(item) = self.current_item().cloned() {
                     self.pending.push(Intent::CopyItemUrl {
@@ -2222,8 +2615,198 @@ impl App {
                 self.pending.push(Intent::SyncLibraries);
             }
             ClientMenuAction::VisibleLibraries => self.open_library_picker(),
+            ClientMenuAction::ToggleGapless => {
+                self.gapless = !self.gapless;
+                self.status_message = Some(format!(
+                    "Gapless audio: {}",
+                    on_off(self.gapless)
+                ));
+                self.pending.push(Intent::SetGapless(self.gapless));
+            }
+            ClientMenuAction::ToggleNormalization => {
+                self.normalization = !self.normalization;
+                self.status_message = Some(format!(
+                    "Volume normalization: {}",
+                    on_off(self.normalization)
+                ));
+                self.pending
+                    .push(Intent::SetNormalization(self.normalization));
+            }
+            ClientMenuAction::CycleEqPreset => {
+                self.eq_preset = cycle_eq_preset(self.eq_preset);
+                self.status_message = Some(format!("EQ: {}", eq_preset_label(self.eq_preset)));
+                self.pending.push(Intent::SetEqPreset(self.eq_preset));
+            }
+            ClientMenuAction::ShowMpvArgs => {
+                self.status_message = Some(format!(
+                    "Custom mpv args: {} (edit [video] mpv_args in config.toml)",
+                    self.mpv_arg_count
+                ));
+            }
+            ClientMenuAction::CycleSort => self.cycle_section_sort(),
+            ClientMenuAction::ToggleUnplayed => self.toggle_section_unplayed(),
+            ClientMenuAction::ClearFilters => self.clear_section_filters(),
             ClientMenuAction::Quit => self.should_quit = true,
         }
+    }
+
+    fn cycle_section_sort(&mut self) {
+        let Some(library_id) = self.current_library().map(|l| l.id.clone()) else {
+            return;
+        };
+        let extras = self.section_filters.entry(library_id).or_default();
+        extras.sort_override = next_sort_override(extras.sort_override.as_deref());
+        let label = extras
+            .sort_override
+            .as_ref()
+            .and_then(|s| s.first().cloned())
+            .unwrap_or_else(|| "Section default".to_string());
+        self.status_message = Some(format!("Sort by: {label}"));
+        self.reapply_current_section();
+    }
+
+    fn toggle_section_unplayed(&mut self) {
+        let Some(library_id) = self.current_library().map(|l| l.id.clone()) else {
+            return;
+        };
+        let extras = self.section_filters.entry(library_id).or_default();
+        if let Some(pos) = extras.filters.iter().position(|f| f == "IsUnplayed") {
+            extras.filters.remove(pos);
+            self.status_message = Some("Showing all".to_string());
+        } else {
+            extras.filters.push("IsUnplayed".to_string());
+            self.status_message = Some("Showing only unplayed".to_string());
+        }
+        self.reapply_current_section();
+    }
+
+    fn clear_section_filters(&mut self) {
+        let Some(library_id) = self.current_library().map(|l| l.id.clone()) else {
+            return;
+        };
+        self.section_filters.remove(&library_id);
+        self.status_message = Some("Filters cleared".to_string());
+        self.reapply_current_section();
+    }
+
+    /// Fire the active library's current section again, picking up whatever
+    /// runtime extras live in `section_filters[library_id]`.
+    fn reapply_current_section(&mut self) {
+        let idx = self.section_selected;
+        self.apply_section(idx);
+    }
+
+    /// Insert the focused audio item into the queue (play-next or append).
+    fn play_next_or_append(&mut self, play_next: bool) {
+        let Some(item) = self.current_item().cloned() else { return };
+        if !matches!(MediaKind::classify(item.kind.as_deref()), MediaKind::Audio) {
+            self.set_status("Only audio items can be queued.");
+            return;
+        }
+        if self.queue.is_empty() {
+            self.pending.push(Intent::Play {
+                item,
+                media: MediaKind::Audio,
+                start_ticks: None,
+            });
+            return;
+        }
+        self.status_message = Some(if play_next {
+            format!("Play next: {}", item.name)
+        } else {
+            format!("Added to queue: {}", item.name)
+        });
+        self.enqueue(item, play_next);
+    }
+
+    /// Start a "genre radio" — queue items with the first genre from the
+    /// current detail and play. Delegates to the browser via a new intent.
+    fn start_genre_radio(&mut self) {
+        let Some(library) = self.current_library().cloned() else { return };
+        let Some(genre) = self
+            .current_detail()
+            .and_then(|d| d.genres.first().cloned())
+        else {
+            self.set_status("No genre on this item.");
+            return;
+        };
+        self.status_message = Some(format!("Genre radio: {genre}"));
+        self.pending.push(Intent::GenreRadio {
+            library_id: library.id,
+            genre,
+        });
+    }
+
+    /// Snapshot the queue and ask the browser to create a server-side playlist.
+    fn save_queue_as_playlist(&mut self) {
+        if self.queue.is_empty() {
+            self.set_status("Queue is empty.");
+            return;
+        }
+        let name = format!(
+            "aquafin queue · {}",
+            chrono_like_now_label()
+        );
+        let item_ids: Vec<String> = self.queue.iter().map(|i| i.id.clone()).collect();
+        self.status_message = Some(format!("Saving queue as \"{name}\"…"));
+        self.pending.push(Intent::CreatePlaylist { name, item_ids });
+    }
+
+    /// Launch mpv on the first trailer URL from the current item's detail.
+    fn watch_first_trailer(&mut self) {
+        let Some(item) = self.current_item().cloned() else { return };
+        let url = self
+            .current_detail()
+            .and_then(|d| d.trailer_urls.first().cloned());
+        match url {
+            Some(url) => {
+                self.set_status(format!("Trailer: {}", item.name));
+                self.pending.push(Intent::WatchTrailer { url, title: item.name });
+            }
+            None => self.set_status("No trailer available for this item."),
+        }
+    }
+
+    /// Use the first genre from `current_detail` as a filter on the active
+    /// library, then re-apply the "All" section.
+    fn browse_by_first_genre(&mut self) {
+        let Some(library) = self.current_library().cloned() else {
+            return;
+        };
+        let Some(genre) = self
+            .current_detail()
+            .and_then(|d| d.genres.first().cloned())
+        else {
+            self.set_status("No genre on this item.");
+            return;
+        };
+        let extras = self.section_filters.entry(library.id.clone()).or_default();
+        extras.genres = vec![genre.clone()];
+        self.section_selected = 0;
+        self.status_message = Some(format!("Browsing by genre: {genre}"));
+        self.reapply_current_section();
+    }
+
+    /// Use the first cast member id from `current_detail` as a filter.
+    fn browse_by_first_person(&mut self) {
+        let Some(library) = self.current_library().cloned() else {
+            return;
+        };
+        let Some((person_id, person_name)) =
+            self.current_detail().and_then(|d| {
+                d.cast
+                    .iter()
+                    .find_map(|p| p.id.clone().map(|id| (id, p.name.clone())))
+            })
+        else {
+            self.set_status("No person on this item.");
+            return;
+        };
+        let extras = self.section_filters.entry(library.id.clone()).or_default();
+        extras.person_ids = vec![person_id];
+        self.section_selected = 0;
+        self.status_message = Some(format!("Browsing by person: {person_name}"));
+        self.reapply_current_section();
     }
 
     /// Open the visible-library picker. Entries are filled async via
@@ -2281,6 +2864,8 @@ impl App {
         VideoOptions {
             audio: Some(selection.audio),
             subtitle: Some(selection.subtitle),
+            start_secs: None,
+            extra_args: Vec::new(),
         }
     }
 
@@ -2518,9 +3103,11 @@ impl App {
         }
         match MediaKind::classify(item.kind.as_deref()) {
             MediaKind::Video => self.open_media_options_view(item),
-            MediaKind::Audio => self
-                .pending
-                .push(Intent::Play { item, media: MediaKind::Audio }),
+            MediaKind::Audio => self.pending.push(Intent::Play {
+                item,
+                media: MediaKind::Audio,
+                start_ticks: None,
+            }),
             MediaKind::Other => {
                 self.status_message = Some(format!("Not playable: {}", item.name));
             }
@@ -2549,6 +3136,7 @@ impl App {
             selected_subtitle: 0,
             cursor: MediaOptionsCursor::Play,
             trailer_urls: Vec::new(),
+            chapters: Vec::new(),
         });
         self.focus = Pane::Content;
         self.pending.push(Intent::LoadMediaOptions { item_id: item.id });
@@ -2648,6 +3236,49 @@ impl App {
             MediaOptionsCursor::Subtitle(n) => {
                 view.selected_subtitle = n;
             }
+            MediaOptionsCursor::Chapter(n) => {
+                let start_ticks = view
+                    .chapters
+                    .get(n)
+                    .map(|c| c.start_position_ticks)
+                    .unwrap_or(0);
+                let item_id = view.item_id.clone();
+                let item_name = view.item_name.clone();
+                let audio = view
+                    .audio_entries
+                    .get(view.selected_audio)
+                    .map(|e| e.choice)
+                    .unwrap_or(TrackChoice::Auto);
+                let subtitle = view
+                    .subtitle_entries
+                    .get(view.selected_subtitle)
+                    .map(|e| e.choice)
+                    .unwrap_or(TrackChoice::Auto);
+                let media_source_id = view
+                    .versions
+                    .get(view.selected_version)
+                    .map(|v| v.source_id.clone());
+                let selection = VideoTrackSelection {
+                    audio,
+                    subtitle,
+                    media_source_id,
+                };
+                self.video_track_selections
+                    .insert(item_id.clone(), selection);
+                self.media_options_view = None;
+                self.focus = Pane::LibraryItems;
+                let item = Item {
+                    id: item_id,
+                    name: item_name,
+                    kind: Some("Movie".to_string()),
+                    ..Default::default()
+                };
+                self.pending.push(Intent::Play {
+                    item,
+                    media: MediaKind::Video,
+                    start_ticks: Some(start_ticks),
+                });
+            }
             MediaOptionsCursor::WatchTrailer => {
                 let url = view.trailer_urls.first().cloned();
                 let title = view.item_name.clone();
@@ -2691,6 +3322,7 @@ impl App {
                 self.pending.push(Intent::Play {
                     item,
                     media: MediaKind::Video,
+                    start_ticks: None,
                 });
             }
         }
@@ -2944,6 +3576,35 @@ impl App {
             }
         }
     }
+
+    /// Flip the focused item's played state and queue a server update.
+    fn toggle_played(&mut self) {
+        let Some(level) = self.current_level_mut() else {
+            return;
+        };
+        let Some(item) = level.items.get_mut(level.selected) else {
+            return;
+        };
+        item.is_played = !item.is_played;
+        let (item_id, played, name) = (item.id.clone(), item.is_played, item.name.clone());
+        self.status_message = Some(if played {
+            format!("Marked played: {name}")
+        } else {
+            format!("Marked unplayed: {name}")
+        });
+        self.pending.push(Intent::SetPlayed { item_id, played });
+    }
+
+    /// Revert an optimistic played toggle when the server call fails.
+    pub fn revert_played(&mut self, item_id: &str, played: bool) {
+        for level in &mut self.stack {
+            for item in &mut level.items {
+                if item.id == item_id {
+                    item.is_played = played;
+                }
+            }
+        }
+    }
 }
 
 /// Run the main browser UI loop until the user quits.
@@ -3057,6 +3718,7 @@ pub(crate) fn run_browser(
                 Intent::ApplySection {
                     library_id,
                     section,
+                    extras,
                 } => {
                     let library_name = app
                         .libraries
@@ -3065,7 +3727,7 @@ pub(crate) fn run_browser(
                         .map(|l| l.name.clone())
                         .unwrap_or_default();
                     if let Some(br) = browser.as_deref_mut() {
-                        br.apply_section(library_id, library_name, section);
+                        br.apply_section(library_id, library_name, section, extras);
                     }
                 }
                 Intent::Search { query } => {
@@ -3094,6 +3756,30 @@ pub(crate) fn run_browser(
                 Intent::SaveAudioPrefs { repeat_mode, shuffle } => {
                     if let Err(e) = persist_audio_prefs(repeat_mode, shuffle) {
                         tracing::warn!(error = %e, "couldn't persist audio prefs");
+                    }
+                }
+                Intent::SetGapless(on) => {
+                    if let Err(e) = persist_gapless(on) {
+                        tracing::warn!(error = %e, "couldn't persist gapless");
+                    }
+                    if let Some(pb) = playback.as_deref_mut() {
+                        pb.set_gapless(on);
+                    }
+                }
+                Intent::SetNormalization(on) => {
+                    if let Err(e) = persist_normalization(on) {
+                        tracing::warn!(error = %e, "couldn't persist normalization");
+                    }
+                    if let Some(pb) = playback.as_deref_mut() {
+                        pb.set_normalization(on);
+                    }
+                }
+                Intent::SetEqPreset(preset) => {
+                    if let Err(e) = persist_eq_preset(preset) {
+                        tracing::warn!(error = %e, "couldn't persist EQ preset");
+                    }
+                    if let Some(pb) = playback.as_deref_mut() {
+                        pb.set_eq_preset(preset);
                     }
                 }
                 Intent::SaveVolume(volume) => {
@@ -3156,6 +3842,16 @@ pub(crate) fn run_browser(
                 Intent::InstantMix { item } => {
                     if let Some(br) = browser.as_deref_mut() {
                         br.instant_mix(item);
+                    }
+                }
+                Intent::GenreRadio { library_id, genre } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.genre_radio(library_id, genre);
+                    }
+                }
+                Intent::CreatePlaylist { name, item_ids } => {
+                    if let Some(br) = browser.as_deref_mut() {
+                        br.create_playlist(name, item_ids);
                     }
                 }
                 Intent::Dislike { item_id } => {
@@ -3232,6 +3928,25 @@ fn persist_audio_prefs(repeat_mode: RepeatMode, shuffle: bool) -> Result<()> {
     let mut config = crate::config::Config::load()?.unwrap_or_default();
     config.audio.repeat_mode = repeat_mode.into();
     config.audio.shuffle = shuffle;
+    config.save()
+}
+
+fn persist_gapless(on: bool) -> Result<()> {
+    let mut config = crate::config::Config::load()?.unwrap_or_default();
+    config.audio.gapless = on;
+    config.save()
+}
+
+fn persist_normalization(on: bool) -> Result<()> {
+    let mut config = crate::config::Config::load()?.unwrap_or_default();
+    config.audio.normalization = on;
+    config.save()
+}
+
+fn persist_eq_preset(preset: crate::config::EqPreset) -> Result<()> {
+    let mut config = crate::config::Config::load()?.unwrap_or_default();
+    config.audio.eq.preset = preset;
+    config.audio.eq.enabled = !matches!(preset, crate::config::EqPreset::Flat);
     config.save()
 }
 
@@ -3531,7 +4246,112 @@ pub(crate) fn options_cursor_positions(view: &MediaOptionsViewState) -> Vec<Medi
     if !view.trailer_urls.is_empty() {
         positions.push(MediaOptionsCursor::WatchTrailer);
     }
+    for i in 0..view.chapters.len() {
+        positions.push(MediaOptionsCursor::Chapter(i));
+    }
     positions
+}
+
+/// Cheap timestamp label for the auto-generated playlist name. Format
+/// `YYYY-MM-DD HH:MM` based on the wall-clock UTC seconds since epoch — good
+/// enough for a sortable, human-readable handle without pulling in `chrono`.
+fn chrono_like_now_label() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let (year, month, day) = days_to_ymd(days);
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}")
+}
+
+/// Convert "days since 1970-01-01" to a `(year, month, day)` tuple using the
+/// Howard Hinnant algorithm. Pure integer math, valid for all positive epochs.
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as i32, m as u32, d as u32)
+}
+
+/// Cycle through the runtime sort presets. `None` means "use section default".
+fn next_sort_override(current: Option<&[String]>) -> Option<Vec<String>> {
+    const ORDER: &[&str] = &[
+        "SortName",
+        "DateCreated",
+        "ProductionYear",
+        "CommunityRating",
+        "PlayCount",
+        "Random",
+        "Runtime",
+    ];
+    let current_first = current.and_then(|s| s.first()).map(String::as_str);
+    let idx = current_first.and_then(|n| ORDER.iter().position(|p| *p == n));
+    match idx {
+        None => Some(vec![ORDER[0].to_string()]),
+        Some(i) if i + 1 < ORDER.len() => Some(vec![ORDER[i + 1].to_string()]),
+        Some(_) => None, // wrap back to "Section default"
+    }
+}
+
+/// Label for the sleep-timer entry in the item menu: shows remaining time when
+/// armed, "End of track" with the EOT mode, or just "Off".
+fn sleep_timer_menu_label(state: SleepTimer, remaining: Option<u64>) -> String {
+    match state {
+        SleepTimer::Off => "Sleep timer: Off".to_string(),
+        SleepTimer::EndOfTrack => "Sleep timer: End of track".to_string(),
+        other => match remaining {
+            Some(secs) => format!("Sleep timer: {} ({} left)", other.label(), format_remaining(secs)),
+            None => format!("Sleep timer: {}", other.label()),
+        },
+    }
+}
+
+/// Render a remaining-seconds count as `Hh Mm` / `Mm Ss` / `Ss`.
+fn format_remaining(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+fn eq_preset_label(p: crate::config::EqPreset) -> &'static str {
+    use crate::config::EqPreset::*;
+    match p {
+        Flat => "Flat",
+        BassBoost => "Bass boost",
+        Vocal => "Vocal",
+        TrebleBoost => "Treble boost",
+        Custom => "Custom",
+    }
+}
+
+fn cycle_eq_preset(p: crate::config::EqPreset) -> crate::config::EqPreset {
+    use crate::config::EqPreset::*;
+    match p {
+        Flat => BassBoost,
+        BassBoost => Vocal,
+        Vocal => TrebleBoost,
+        TrebleBoost => Flat,
+        Custom => Flat,
+    }
 }
 
 /// Short label for a `TrackChoice`, used by the item-menu summary line.
@@ -4107,7 +4927,7 @@ mod tests {
         app.handle_key(press(KeyCode::Enter));
         assert!(matches!(
             app.take_intents().as_slice(),
-            [Intent::Play { media: MediaKind::Audio, item }] if item.name == "Track C"
+            [Intent::Play { media: MediaKind::Audio, item, .. }] if item.name == "Track C"
         ));
     }
 
@@ -4278,6 +5098,8 @@ mod tests {
                 primary_image_tag: None,
                 is_folder: false,
                 is_favorite: false,
+                is_played: false,
+                normalization_gain_db: None,
             }],
         }]);
         let out = rendered(&app, 120, 30);
@@ -4402,7 +5224,7 @@ mod tests {
         // intent so the user's choice persists.
         assert_eq!(intents.len(), 2);
         match &intents[0] {
-            Intent::ApplySection { library_id, section } => {
+            Intent::ApplySection { library_id, section, .. } => {
                 assert_eq!(library_id, "music");
                 assert_eq!(section.name, "Albums");
             }
@@ -4947,9 +5769,12 @@ mod tests {
             items: vec![typed_item("Track A", "Audio")],
         }]);
         app.handle_key(press(KeyCode::Char('p')));
-        // Order: Show lyrics, Show info, Play, Add to favorites,
-        // Add to playlist…, Instant mix, Dislike, Copy URL.
-        for _ in 0..5 {
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        let idx = entries
+            .iter()
+            .position(|e| e == "Instant mix")
+            .expect("Instant mix entry present");
+        for _ in 0..idx {
             app.handle_key(press(KeyCode::Down));
         }
         app.handle_key(press(KeyCode::Enter));
@@ -4968,7 +5793,12 @@ mod tests {
             items: vec![typed_item("Track A", "Audio")],
         }]);
         app.handle_key(press(KeyCode::Char('p')));
-        for _ in 0..6 {
+        let (_, entries, _) = app.popup_menu().expect("item menu open");
+        let idx = entries
+            .iter()
+            .position(|e| e == "Dislike track")
+            .expect("Dislike entry present");
+        for _ in 0..idx {
             app.handle_key(press(KeyCode::Down));
         }
         app.handle_key(press(KeyCode::Enter));
@@ -5007,8 +5837,8 @@ mod tests {
             items: vec![typed_item("Track A", "Audio")],
         }]);
         app.handle_key(press(KeyCode::Char('p')));
-        // Walk to "Add to playlist…" (index 4).
-        for _ in 0..4 {
+        // Walk to "Add to playlist…" (index 5: lyrics, info, play, favorite, mark played, playlist).
+        for _ in 0..5 {
             app.handle_key(press(KeyCode::Down));
         }
         app.handle_key(press(KeyCode::Enter));
@@ -5317,6 +6147,7 @@ mod tests {
         let mut app = app_with_item("Movie");
         let detail = ItemDetail {
             cast: vec![Person {
+                id: None,
                 name: "Neo".to_string(),
                 role: Some("Hero".to_string()),
                 kind: Some("Actor".to_string()),

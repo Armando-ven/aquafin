@@ -109,6 +109,11 @@ impl Drop for VideoSession {
 pub struct VideoOptions {
     pub audio: Option<TrackChoice>,
     pub subtitle: Option<TrackChoice>,
+    /// Start position in seconds (maps to mpv `--start=<secs>`). Used for
+    /// "play from chapter N" launches.
+    pub start_secs: Option<f64>,
+    /// Extra args spliced after aquafin's own flags (from `[video] mpv_args`).
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +158,14 @@ pub fn spawn(
     }
     if let Some(sid) = options.subtitle.and_then(TrackChoice::as_arg) {
         command.arg(format!("--sid={sid}"));
+    }
+    if let Some(secs) = options.start_secs {
+        if secs > 0.0 {
+            command.arg(format!("--start={secs:.3}"));
+        }
+    }
+    for arg in &options.extra_args {
+        command.arg(arg);
     }
     let child = command
         .arg(stream_url)

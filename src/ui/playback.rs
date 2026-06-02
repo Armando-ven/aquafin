@@ -10,18 +10,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::{Handle, Runtime};
 
 use crate::api::models::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
 use crate::api::JellyfinClient;
 use crate::audio::{
-    AudioEngine, AudioMonitor, TrackMeta, SUPPORTED_AUDIO_CODECS, SUPPORTED_CONTAINERS,
+    AudioEngine, AudioMonitor, EqChoice, TrackMeta, SUPPORTED_AUDIO_CODECS, SUPPORTED_CONTAINERS,
 };
+use crate::config::EqPreset;
 use crate::video::{self, VideoError, VideoSession};
 
-use super::app::{App, Intent, Item, MediaKind, NowPlaying};
+use super::app::{App, Intent, Item, MediaKind, NowPlaying, SleepTimer};
 
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
 const PROGRESS_INTERVAL_SECS: u64 = 10;
@@ -34,6 +35,12 @@ enum FetchResult {
     /// The server rejected a favorite toggle; the optimistic flip in the UI
     /// must be reverted to `previous`.
     FavoriteFailed {
+        item_id: String,
+        previous: bool,
+        error: String,
+    },
+    /// Same shape as `FavoriteFailed`, for the played-state toggle.
+    PlayedFailed {
         item_id: String,
         previous: bool,
         error: String,
@@ -64,6 +71,16 @@ pub struct Playback {
     fetch_tx: Sender<FetchResult>,
     fetch_rx: Receiver<FetchResult>,
     seek_seconds: u32,
+    /// Absolute deadline for the timed sleep choices. `None` for Off / EndOfTrack.
+    sleep_deadline: Option<Instant>,
+    /// True when the active sleep choice is EndOfTrack: stop after current track.
+    sleep_after_track: bool,
+    /// Extra args to splice into every `mpv` invocation, from `[video] mpv_args`.
+    mpv_args: Vec<String>,
+    /// Gapless flag (not yet fully wired into a preload pipeline; tracked so
+    /// the menu state survives across the playback boundary).
+    #[allow(dead_code)]
+    gapless: bool,
 }
 
 impl Playback {
@@ -78,19 +95,48 @@ impl Playback {
             fetch_tx,
             fetch_rx,
             seek_seconds,
+            sleep_deadline: None,
+            sleep_after_track: false,
+            mpv_args: Vec::new(),
+            gapless: false,
         }
+    }
+
+    pub fn set_mpv_args(&mut self, args: Vec<String>) {
+        self.mpv_args = args;
+    }
+
+    pub fn set_gapless(&mut self, on: bool) {
+        self.gapless = on;
+    }
+
+    pub fn set_normalization(&mut self, on: bool) {
+        self.audio.set_normalization_enabled(on);
+    }
+
+    pub fn set_eq_preset(&mut self, preset: EqPreset) {
+        let choice = match preset {
+            EqPreset::Flat | EqPreset::Custom => None,
+            EqPreset::BassBoost => Some(EqChoice::BassBoost),
+            EqPreset::Vocal => Some(EqChoice::Vocal),
+            EqPreset::TrebleBoost => Some(EqChoice::TrebleBoost),
+        };
+        self.audio.set_eq(choice);
     }
 
     /// Perform one queued side effect.
     pub fn dispatch(&mut self, intent: Intent, app: &mut App) {
         match intent {
-            Intent::Play { item, media } => match media {
-                MediaKind::Video => self.play_video(item, app),
+            Intent::Play { item, media, start_ticks } => match media {
+                MediaKind::Video => self.play_video(item, start_ticks, app),
                 MediaKind::Audio => {
                     // Build a queue from the active level so the engine can
                     // auto-advance to the next track without user input.
                     app.build_queue_for(&item);
                     self.start_audio(item, app);
+                    if let Some(ticks) = start_ticks {
+                        self.audio.seek_relative(ticks_to_secs(ticks) as i32);
+                    }
                 }
                 MediaKind::Other => {}
             },
@@ -116,6 +162,11 @@ impl Playback {
             Intent::SeekForward => self.seek(self.seek_seconds as i32),
             Intent::SeekBackward => self.seek(-(self.seek_seconds as i32)),
             Intent::SetFavorite { item_id, favorite } => self.set_favorite(item_id, favorite, app),
+            Intent::SetPlayed { item_id, played } => self.set_played(item_id, played, app),
+            Intent::SetSleepTimer(choice) => self.arm_sleep_timer(choice),
+            Intent::SetGapless(on) => self.set_gapless(on),
+            Intent::SetNormalization(on) => self.set_normalization(on),
+            Intent::SetEqPreset(preset) => self.set_eq_preset(preset),
             Intent::QueueNext => {
                 if let Some(next) = app.advance_queue() {
                     self.stop_audio();
@@ -147,6 +198,8 @@ impl Playback {
             | Intent::LoadPlaylists { .. }
             | Intent::AddToPlaylist { .. }
             | Intent::InstantMix { .. }
+            | Intent::GenreRadio { .. }
+            | Intent::CreatePlaylist { .. }
             | Intent::Dislike { .. }
             | Intent::CopyItemUrl { .. }
             | Intent::LoadVideoTracks { .. }
@@ -160,7 +213,11 @@ impl Playback {
     /// id so it doesn't collide with any movie session's IPC socket.
     fn watch_trailer(&mut self, url: String, title: String, app: &mut App) {
         let socket_id = format!("trailer-{}", title);
-        match video::spawn(&url, &socket_id, &title, video::VideoOptions::default()) {
+        let options = video::VideoOptions {
+            extra_args: self.mpv_args.clone(),
+            ..Default::default()
+        };
+        match video::spawn(&url, &socket_id, &title, options) {
             Ok(session) => {
                 if let Some(mut previous) = self.video.take() {
                     previous.stop.store(true, Ordering::SeqCst);
@@ -230,6 +287,42 @@ impl Playback {
         let _ = app;
     }
 
+    /// Arm or clear the sleep timer based on the user's cycle choice.
+    fn arm_sleep_timer(&mut self, choice: SleepTimer) {
+        match choice {
+            SleepTimer::Off => {
+                self.sleep_deadline = None;
+                self.sleep_after_track = false;
+            }
+            SleepTimer::EndOfTrack => {
+                self.sleep_deadline = None;
+                self.sleep_after_track = true;
+            }
+            other => {
+                self.sleep_after_track = false;
+                self.sleep_deadline = other.duration().map(|d| Instant::now() + d);
+            }
+        }
+    }
+
+    /// POST/DELETE the played state; on failure, revert the optimistic flip.
+    fn set_played(&self, item_id: String, played: bool, app: &mut App) {
+        let client = self.client.clone();
+        let tx = self.fetch_tx.clone();
+        let id = item_id.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = client.set_played(&id, played).await {
+                tracing::warn!(error = %e, item_id = %id, played, "played request failed");
+                let _ = tx.send(FetchResult::PlayedFailed {
+                    item_id: id,
+                    previous: !played,
+                    error: e.to_string(),
+                });
+            }
+        });
+        let _ = app;
+    }
+
     /// Per-frame housekeeping: collect finished downloads, notice mpv/audio
     /// ending, surface late errors, and refresh the now-playing snapshot.
     pub fn tick(&mut self, app: &mut App) {
@@ -240,6 +333,10 @@ impl Playback {
                 FetchResult::FavoriteFailed { item_id, previous, error } => {
                     app.revert_favorite(&item_id, previous);
                     app.show_error(format!("Couldn't update favorite: {error}"));
+                }
+                FetchResult::PlayedFailed { item_id, previous, error } => {
+                    app.revert_played(&item_id, previous);
+                    app.show_error(format!("Couldn't update played: {error}"));
                 }
             }
         }
@@ -254,10 +351,16 @@ impl Playback {
 
         // Track finished on its own? Its reporter notices the engine went idle
         // and posts Stopped; we drop our handle and, if a queue is set, kick
-        // off the next track.
+        // off the next track — unless the sleep timer is set to stop at the
+        // end of the current track.
         if self.audio.take_finished() {
             self.audio_session = None;
-            if let Some(next) = app.advance_queue() {
+            if self.sleep_after_track {
+                self.sleep_after_track = false;
+                app.clear_queue();
+                app.set_status("Sleep timer: stopped at end of track");
+                app.sleep_timer = SleepTimer::Off;
+            } else if let Some(next) = app.advance_queue() {
                 self.start_audio(next, app);
             }
         }
@@ -265,6 +368,32 @@ impl Playback {
         if let Some(error) = self.audio.last_error() {
             app.show_error(error);
             self.audio_session = None;
+        }
+
+        // Absolute-time sleep deadline expired? Stop everything. Otherwise
+        // expose the remaining seconds so the UI can show a countdown.
+        match self.sleep_deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    self.sleep_deadline = None;
+                    self.sleep_after_track = false;
+                    if let Some(mut video) = self.video.take() {
+                        video.stop.store(true, Ordering::SeqCst);
+                        video.session.kill();
+                    }
+                    app.clear_queue();
+                    self.stop_audio();
+                    app.set_status("Sleep timer expired");
+                    app.sleep_timer = SleepTimer::Off;
+                    app.sleep_remaining_secs = None;
+                } else {
+                    app.sleep_remaining_secs = Some(deadline.duration_since(now).as_secs());
+                }
+            }
+            None => {
+                app.sleep_remaining_secs = None;
+            }
         }
 
         app.now_playing = self.now_playing();
@@ -300,13 +429,15 @@ impl Playback {
 
     // --- video ---------------------------------------------------------------
 
-    fn play_video(&mut self, item: Item, app: &mut App) {
+    fn play_video(&mut self, item: Item, start_ticks: Option<i64>, app: &mut App) {
         self.stop_audio(); // don't stack in-app audio under a video
         let source_id = app.video_media_source_for(&item.id);
         let url = self
             .client
             .video_stream_url(&item.id, source_id.as_deref());
-        let options = app.video_options_for(&item.id);
+        let mut options = app.video_options_for(&item.id);
+        options.start_secs = start_ticks.map(ticks_to_secs);
+        options.extra_args = self.mpv_args.clone();
         match video::spawn(&url, &item.id, &item.name, options) {
             Ok(session) => {
                 if let Some(mut previous) = self.video.take() {
@@ -394,6 +525,7 @@ impl Playback {
             item_id: item.id.clone(),
             title: item.name.clone(),
             subtitle: None,
+            normalization_gain_db: item.normalization_gain_db,
         };
         app.set_status(format!("Loading: {}", item.name));
         self.rt.spawn(async move {
@@ -499,6 +631,10 @@ fn ticks_to_duration(ticks: i64) -> Option<Duration> {
     (ticks > 0).then(|| Duration::from_secs_f64(ticks as f64 / TICKS_PER_SECOND))
 }
 
+fn ticks_to_secs(ticks: i64) -> f64 {
+    ticks as f64 / TICKS_PER_SECOND
+}
+
 // Reporting helpers: all best-effort — a failed report is logged, never fatal.
 
 async fn report_start(client: &JellyfinClient, item_id: &str, can_seek: bool, method: &str) {
@@ -583,7 +719,7 @@ mod tests {
             }],
         }]);
         let item = app.current_item().cloned().unwrap();
-        playback.dispatch(Intent::Play { item, media: MediaKind::Audio }, &mut app);
+        playback.dispatch(Intent::Play { item, media: MediaKind::Audio, start_ticks: None }, &mut app);
         assert!(app.take_intents().iter().any(|i| matches!(
             i,
             Intent::LoadCurrentDetail { item_id, .. } if item_id == "track-1"

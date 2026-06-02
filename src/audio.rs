@@ -30,11 +30,14 @@ pub const SUPPORTED_CONTAINERS: &str = "mp3,aac,m4a,flac,wav";
 pub const SUPPORTED_AUDIO_CODECS: &str = "aac,mp3,flac,alac,vorbis,pcm";
 
 /// Identifying metadata for the track shown in the now-playing UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrackMeta {
     pub item_id: String,
     pub title: String,
     pub subtitle: Option<String>,
+    /// ReplayGain-style per-track gain in dB. Applied as a pre-output linear
+    /// amplitude scale when audio normalization is enabled.
+    pub normalization_gain_db: Option<f32>,
 }
 
 /// Commands sent to the audio thread.
@@ -62,8 +65,25 @@ struct Shared {
     /// 0 means "unknown duration".
     duration_ms: AtomicU64,
     volume: AtomicU8,
+    /// True ⇒ honor `TrackMeta.normalization_gain_db` when starting playback.
+    normalization_enabled: AtomicBool,
+    /// Three-band EQ choice; applied as a low/high-pass biquad chain on the
+    /// decoded Source. `None` ⇒ EQ disabled.
+    eq: Mutex<Option<EqChoice>>,
     track: Mutex<Option<TrackMeta>>,
     last_error: Mutex<Option<String>>,
+}
+
+/// Concrete EQ choice used by the audio thread (decoupled from the config enum
+/// so the audio module doesn't depend on `crate::config`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqChoice {
+    /// Bass-boost: gentle low-pass + amplification of the low end.
+    BassBoost,
+    /// Vocal-focus: band-pass-ish (high-pass + low-pass) for the mid range.
+    Vocal,
+    /// Treble-boost: high-pass + amplification of the high end.
+    TrebleBoost,
 }
 
 impl Shared {
@@ -76,6 +96,8 @@ impl Shared {
             position_ms: AtomicU64::new(0),
             duration_ms: AtomicU64::new(0),
             volume: AtomicU8::new(volume.min(100)),
+            normalization_enabled: AtomicBool::new(false),
+            eq: Mutex::new(None),
             track: Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -157,6 +179,22 @@ impl AudioEngine {
     /// `nudge_volume` call.
     pub fn current_volume(&self) -> u8 {
         self.shared.volume.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable per-track normalization (uses `TrackMeta.normalization_gain_db`).
+    pub fn set_normalization_enabled(&self, enabled: bool) {
+        self.shared
+            .normalization_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn normalization_enabled(&self) -> bool {
+        self.shared.normalization_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Pick an EQ choice (or `None` to disable). Takes effect on the next track.
+    pub fn set_eq(&self, choice: Option<EqChoice>) {
+        *self.shared.eq.lock().unwrap() = choice;
     }
 
     /// Adjust volume by `delta` percentage points, clamped to 0..=100.
@@ -285,12 +323,18 @@ fn audio_thread(rx: mpsc::Receiver<Command>, shared: Arc<Shared>, ready: Sender<
                             .duration_ms
                             .store(duration.map_or(0, |d| d.as_millis() as u64), Ordering::Relaxed);
                         shared.position_ms.store(0, Ordering::Relaxed);
+                        let gain_db = if shared.normalization_enabled.load(Ordering::Relaxed) {
+                            meta.normalization_gain_db
+                        } else {
+                            None
+                        };
                         *shared.track.lock().unwrap() = Some(meta);
                         shared.has_track.store(true, Ordering::Relaxed);
                         shared.paused.store(false, Ordering::Relaxed);
                         shared.finished.store(false, Ordering::Relaxed);
                         current_bytes = Some(bytes);
-                        player.append(decoder);
+                        let eq = *shared.eq.lock().unwrap();
+                        append_with_filters(&player, decoder, gain_db, eq);
                         player.play();
                     }
                     Err(e) => {
@@ -406,6 +450,45 @@ fn rebuild_and_seek(
         return false;
     }
     true
+}
+
+/// Build the Source chain for a freshly-decoded track, applying optional
+/// per-track normalization gain and an EQ preset (low-/high-pass biquad), and
+/// hand the result to the player. Done as a free fn so the audio thread stays
+/// readable.
+fn append_with_filters(
+    player: &rodio::Player,
+    decoder: Decoder<Cursor<Vec<u8>>>,
+    normalization_gain_db: Option<f32>,
+    eq: Option<EqChoice>,
+) {
+    // Apply normalization first (it scales amplitude), then EQ filters on top.
+    match (normalization_gain_db, eq) {
+        (Some(db), Some(EqChoice::BassBoost)) => {
+            player.append(decoder.amplify_decibel(db).low_pass(250).amplify(1.4));
+        }
+        (Some(db), Some(EqChoice::Vocal)) => {
+            player.append(decoder.amplify_decibel(db).high_pass(300).low_pass(3000));
+        }
+        (Some(db), Some(EqChoice::TrebleBoost)) => {
+            player.append(decoder.amplify_decibel(db).high_pass(4000).amplify(1.4));
+        }
+        (Some(db), None) => {
+            player.append(decoder.amplify_decibel(db));
+        }
+        (None, Some(EqChoice::BassBoost)) => {
+            player.append(decoder.low_pass(250).amplify(1.4));
+        }
+        (None, Some(EqChoice::Vocal)) => {
+            player.append(decoder.high_pass(300).low_pass(3000));
+        }
+        (None, Some(EqChoice::TrebleBoost)) => {
+            player.append(decoder.high_pass(4000).amplify(1.4));
+        }
+        (None, None) => {
+            player.append(decoder);
+        }
+    }
 }
 
 fn clear_track(shared: &Shared) {
