@@ -19,10 +19,16 @@ pub fn render(
     focused: bool,
     theme: &Theme,
 ) {
+    // Show item count next to the breadcrumb (only when the level has loaded
+    // and is non-empty) so the user knows how many entries the list has.
+    let count_suffix = level
+        .filter(|l| !l.loading && !l.items.is_empty())
+        .map(|l| format!(" ({})", l.items.len()))
+        .unwrap_or_default();
     let title = if breadcrumb.is_empty() {
-        " Items ".to_string()
+        format!(" Items{count_suffix} ")
     } else {
-        format!(" {breadcrumb} ")
+        format!(" {breadcrumb}{count_suffix} ")
     };
     let block = Block::bordered()
         .title(title)

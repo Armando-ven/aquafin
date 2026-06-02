@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use image::DynamicImage;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
@@ -39,8 +40,15 @@ pub struct Images {
     /// `None` when the terminal has no graphics support — image areas stay blank.
     picker: Option<Picker>,
     cache: HashMap<String, Entry>,
-    tx: Sender<(String, Option<DynamicImage>)>,
-    rx: Receiver<(String, Option<DynamicImage>)>,
+    /// Dominant vibrant color extracted from each cover, used to tint the UI
+    /// to match the now-playing track. Populated alongside `cache`.
+    colors: HashMap<String, Color>,
+    /// Item ids whose color request is in flight, so we keep extracting even
+    /// when the terminal can't render the image itself (kept separate from
+    /// `cache` because `cache` only exists when graphics are available).
+    color_pending: std::collections::HashSet<String>,
+    tx: Sender<(String, Option<DynamicImage>, Option<Color>)>,
+    rx: Receiver<(String, Option<DynamicImage>, Option<Color>)>,
 }
 
 impl Images {
@@ -52,6 +60,8 @@ impl Images {
             client,
             picker,
             cache: HashMap::new(),
+            colors: HashMap::new(),
+            color_pending: std::collections::HashSet::new(),
             tx,
             rx,
         }
@@ -62,32 +72,59 @@ impl Images {
     }
 
     /// Ensure the primary image for `item_id` is being fetched (no-op if already
-    /// requested, ready, or failed). Cheap to call every frame.
+    /// requested, ready, or failed). Cheap to call every frame. Even with no
+    /// terminal graphics support the fetch still runs so the dominant-color
+    /// extraction (used to tint the UI by the current cover) can populate.
     pub fn request(&mut self, item_id: &str) {
-        if item_id.is_empty() || self.picker.is_none() || self.cache.contains_key(item_id) {
+        if item_id.is_empty() {
             return;
         }
-        self.cache.insert(item_id.to_string(), Entry::Loading);
+        let needs_render = self.picker.is_some() && !self.cache.contains_key(item_id);
+        let needs_color =
+            !self.colors.contains_key(item_id) && !self.color_pending.contains(item_id);
+        if !needs_render && !needs_color {
+            return;
+        }
+        if needs_render {
+            self.cache.insert(item_id.to_string(), Entry::Loading);
+        }
+        if needs_color {
+            self.color_pending.insert(item_id.to_string());
+        }
         let client = self.client.clone();
         let tx = self.tx.clone();
         let id = item_id.to_string();
         self.rt.spawn(async move {
             let image = load_image(&client, &id).await;
-            let _ = tx.send((id, image));
+            let color = image.as_ref().and_then(dominant_color);
+            let _ = tx.send((id, image, color));
         });
     }
 
-    /// Promote any finished downloads into renderable protocols.
+    /// Promote any finished downloads into renderable protocols (and stash the
+    /// extracted dominant color for the now-playing tint).
     pub fn tick(&mut self) {
-        while let Ok((id, image)) = self.rx.try_recv() {
-            let entry = match (image, &self.picker) {
-                (Some(image), Some(picker)) => {
-                    Entry::Ready(Box::new(picker.new_resize_protocol(image)))
-                }
-                _ => Entry::Failed,
-            };
-            self.cache.insert(id, entry);
+        while let Ok((id, image, color)) = self.rx.try_recv() {
+            self.color_pending.remove(&id);
+            if let Some(color) = color {
+                self.colors.insert(id.clone(), color);
+            }
+            if self.picker.is_some() {
+                let entry = match (image, &self.picker) {
+                    (Some(image), Some(picker)) => {
+                        Entry::Ready(Box::new(picker.new_resize_protocol(image)))
+                    }
+                    _ => Entry::Failed,
+                };
+                self.cache.insert(id, entry);
+            }
         }
+    }
+
+    /// Dominant vibrant color extracted from `item_id`'s cover, if it has
+    /// landed yet.
+    pub fn color_for(&self, item_id: &str) -> Option<Color> {
+        self.colors.get(item_id).copied()
     }
 
     /// Draw the cover for `item_id` into `area`. Returns `true` if an image was
@@ -151,6 +188,93 @@ async fn load_image(client: &JellyfinClient, item_id: &str) -> Option<DynamicIma
         .await
         .ok()
         .flatten()
+}
+
+/// Extract a vibrant dominant color from `image`, suitable for use as a UI
+/// accent. The image is downsampled, near-grayscale / near-black / near-white
+/// pixels are dropped, and the remainder is binned by hue (12 bins). The
+/// heaviest bin's saturation-weighted average is then boosted so a muted
+/// cover still yields a usable accent.
+fn dominant_color(image: &DynamicImage) -> Option<Color> {
+    let small = image.thumbnail(80, 80).to_rgb8();
+    if small.width() == 0 || small.height() == 0 {
+        return None;
+    }
+    const BINS: usize = 12;
+    let mut weights = [0.0f32; BINS];
+    let mut sum_r = [0.0f32; BINS];
+    let mut sum_g = [0.0f32; BINS];
+    let mut sum_b = [0.0f32; BINS];
+    for px in small.pixels() {
+        let [r, g, b] = px.0;
+        let (h, s, v) = rgb_to_hsv(r, g, b);
+        // Skip washed-out and pitch-dark pixels so the bin winner is genuinely
+        // a chromatic dominant rather than the background brightness average.
+        if s < 0.30 || v < 0.20 || v > 0.95 {
+            continue;
+        }
+        let weight = s * v;
+        let bin = ((h / (360.0 / BINS as f32)) as usize) % BINS;
+        weights[bin] += weight;
+        sum_r[bin] += r as f32 * weight;
+        sum_g[bin] += g as f32 * weight;
+        sum_b[bin] += b as f32 * weight;
+    }
+    let (best, &w) = weights
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+    if w <= 0.0 {
+        return None;
+    }
+    let r = (sum_r[best] / w).round().clamp(0.0, 255.0) as u8;
+    let g = (sum_g[best] / w).round().clamp(0.0, 255.0) as u8;
+    let b = (sum_b[best] / w).round().clamp(0.0, 255.0) as u8;
+    // Boost low-saturation / low-value picks so the resulting accent reads as
+    // an accent rather than a muddy mid-tone.
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+    let (r, g, b) = hsv_to_rgb(h, s.max(0.65), v.max(0.70));
+    Some(Color::Rgb(r, g, b))
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == rf {
+        60.0 * (((gf - bf) / delta).rem_euclid(6.0))
+    } else if max == gf {
+        60.0 * ((bf - rf) / delta + 2.0)
+    } else {
+        60.0 * ((rf - gf) / delta + 4.0)
+    };
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    (h, s, max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let h6 = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (h6.rem_euclid(2.0) - 1.0).abs());
+    let (rf, gf, bf) = match h6 as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    (
+        ((rf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((gf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((bf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// `$XDG_CACHE_HOME/aquafin/images/<itemId>` — the raw downloaded image bytes.

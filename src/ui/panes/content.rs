@@ -3,14 +3,16 @@
 //! item's cover, title, and description live in the info pane (right column
 //! top); this pane stays a placeholder until the user drills in.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::Frame;
 
 use crate::theme::Theme;
 use crate::ui::app::{
-    options_cursor_positions, Level, MediaOptionsCursor, MediaOptionsViewState,
+    options_cursor_positions, Item, Level, MediaKind, MediaOptionsCursor, MediaOptionsViewState,
 };
 use crate::ui::panes::item_kind_decor;
 
@@ -42,8 +44,14 @@ fn render_placeholder(frame: &mut Frame, area: Rect, focused: bool, theme: &Them
 }
 
 fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, theme: &Theme) {
+    // Append item count once the level has loaded and has content.
+    let count_suffix = if !level.loading && !level.items.is_empty() {
+        format!(" ({})", level.items.len())
+    } else {
+        String::new()
+    };
     let block = Block::bordered()
-        .title(format!(" {} ", level.title))
+        .title(format!(" {}{count_suffix} ", level.title))
         .border_style(theme.border(focused));
 
     if level.loading {
@@ -58,6 +66,12 @@ fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, t
             Paragraph::new("Empty.").style(theme.muted()).block(block),
             area,
         );
+        return;
+    }
+
+    // Music tracks get a multi-column tracklist; everything else stays a list.
+    if is_all_audio(&level.items) {
+        render_track_table(frame, area, level, focused, theme, block);
         return;
     }
 
@@ -79,6 +93,98 @@ fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, t
     let mut state = ListState::default();
     state.select(Some(level.selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn is_all_audio(items: &[Item]) -> bool {
+    !items.is_empty()
+        && items
+            .iter()
+            .all(|i| matches!(MediaKind::classify(i.kind.as_deref()), MediaKind::Audio))
+}
+
+/// Render the drilled-in level as a music tracklist with columns:
+/// `#` (track number), `Title`, `Plays` (play count), `♥` (favorite marker),
+/// `Length` (formatted runtime).
+fn render_track_table(
+    frame: &mut Frame,
+    area: Rect,
+    level: &Level,
+    focused: bool,
+    theme: &Theme,
+    block: Block<'_>,
+) {
+    let header = Row::new(vec![
+        Cell::from("  #"),
+        Cell::from("Title"),
+        Cell::from("Plays"),
+        Cell::from("♥"),
+        Cell::from("Length"),
+    ])
+    .style(theme.header())
+    .height(1);
+
+    let rows: Vec<Row> = level
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let number = item
+                .track_number
+                .map(|n| format!("{n:>3}"))
+                .unwrap_or_else(|| format!("{:>3}", i + 1));
+            let plays = if item.play_count > 0 {
+                item.play_count.to_string()
+            } else {
+                "—".to_string()
+            };
+            let fav = if item.is_favorite { "♥" } else { " " };
+            let length = item
+                .run_time_ticks
+                .and_then(format_track_length)
+                .unwrap_or_else(|| "—".to_string());
+            Row::new(vec![
+                Cell::from(number).style(theme.muted()),
+                Cell::from(item.name.clone()),
+                Cell::from(plays).style(theme.muted()),
+                Cell::from(fav),
+                Cell::from(length).style(theme.muted()),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Min(10),
+        Constraint::Length(7),
+        Constraint::Length(3),
+        Constraint::Length(8),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .style(theme.list_item())
+        .row_highlight_style(theme.selected_item(focused))
+        .highlight_symbol("› ");
+
+    let mut state = TableState::default();
+    state.select(Some(level.selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// Jellyfin `RunTimeTicks` → `m:ss` (or `h:mm:ss` past an hour). Used for the
+/// `Length` column in the music tracklist.
+fn format_track_length(ticks: i64) -> Option<String> {
+    if ticks <= 0 {
+        return None;
+    }
+    let total = (ticks / 10_000_000) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    Some(if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    })
 }
 
 /// Pre-play media options for a video item: version + audio + subtitles +

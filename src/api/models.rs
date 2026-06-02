@@ -175,6 +175,8 @@ pub struct MediaSource {
     pub container: Option<String>,
     pub size: Option<i64>,
     pub run_time_ticks: Option<i64>,
+    /// Top-level bitrate in bits per second (when the server reports one).
+    pub bitrate: Option<i64>,
     pub media_streams: Vec<MediaStream>,
 }
 
@@ -191,6 +193,13 @@ pub struct MediaStream {
     pub display_title: Option<String>,
     pub codec: Option<String>,
     pub channel_layout: Option<String>,
+    /// Channel count (`2` ⇒ stereo, `6` ⇒ 5.1, …). Used when `channel_layout`
+    /// is missing.
+    pub channels: Option<i32>,
+    /// Sampling rate in Hz (e.g. `44100`, `48000`).
+    pub sample_rate: Option<i32>,
+    /// Per-stream bitrate in bits per second.
+    pub bit_rate: Option<i64>,
     pub is_default: Option<bool>,
     pub is_forced: Option<bool>,
 }

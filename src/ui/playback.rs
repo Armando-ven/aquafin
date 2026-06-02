@@ -525,15 +525,27 @@ impl Playback {
             item_id: item.id.clone(),
             title: item.name.clone(),
             subtitle: None,
+            artist: item.primary_artist_name.clone().filter(|s| !s.is_empty()),
+            album: item.album_name.clone().filter(|s| !s.is_empty()),
+            format_summary: None,
             normalization_gain_db: item.normalization_gain_db,
         };
         app.set_status(format!("Loading: {}", item.name));
         self.rt.spawn(async move {
-            let result = match client
-                .audio_bytes(&id, SUPPORTED_CONTAINERS, SUPPORTED_AUDIO_CODECS)
-                .await
-            {
-                Ok(bytes) => FetchResult::Ready { bytes, meta },
+            // Fetch the audio bytes and the playback-info (for the format
+            // summary) in parallel — the bytes are required, the format info
+            // is best-effort.
+            let bytes_fut = client.audio_bytes(&id, SUPPORTED_CONTAINERS, SUPPORTED_AUDIO_CODECS);
+            let info_fut = client.playback_info(&id);
+            let (bytes_res, info_res) = tokio::join!(bytes_fut, info_fut);
+            let result = match bytes_res {
+                Ok(bytes) => {
+                    let mut meta = meta;
+                    if let Ok(info) = info_res {
+                        meta.format_summary = format_summary_from_info(&info);
+                    }
+                    FetchResult::Ready { bytes, meta }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, item_id = %id, "audio download failed");
                     FetchResult::Failed(format!("Couldn't load track: {e}"))
@@ -601,6 +613,9 @@ impl Playback {
                 kind: MediaKind::Video,
                 title: video.item.name.clone(),
                 subtitle: Some("Direct play in mpv".to_string()),
+                artist: None,
+                album: None,
+                format_summary: None,
                 position: Duration::from_millis(video.position_ms.load(Ordering::Relaxed)),
                 duration: video.item.run_time_ticks.and_then(ticks_to_duration),
                 paused: false,
@@ -615,6 +630,9 @@ impl Playback {
                     kind: MediaKind::Audio,
                     title: track.title,
                     subtitle: track.subtitle,
+                    artist: track.artist,
+                    album: track.album,
+                    format_summary: track.format_summary,
                     position: snapshot.position,
                     duration: snapshot.duration,
                     paused: snapshot.paused,
@@ -623,6 +641,72 @@ impl Playback {
             }
         }
         None
+    }
+}
+
+/// Build a one-line audio-format summary from a `/PlaybackInfo` response:
+/// container, sample rate, channel layout, bitrate. Returns `None` when the
+/// server didn't provide enough data to form even one segment.
+fn format_summary_from_info(info: &crate::api::models::PlaybackInfoResponse) -> Option<String> {
+    let source = info.media_sources.first()?;
+    let audio = source
+        .media_streams
+        .iter()
+        .find(|s| s.type_.as_deref() == Some("Audio"));
+    let mut parts: Vec<String> = Vec::new();
+
+    // Container or codec (uppercase, e.g. "FLAC"). Prefer the source-level
+    // container — that's what's actually being streamed; fall back to the
+    // audio stream's codec.
+    let format = source
+        .container
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| audio.and_then(|a| a.codec.as_deref().filter(|s| !s.is_empty())));
+    if let Some(f) = format {
+        parts.push(f.to_uppercase());
+    }
+
+    // Sample rate, in kHz (44100 → "44.1 kHz").
+    if let Some(sr) = audio.and_then(|a| a.sample_rate).filter(|sr| *sr > 0) {
+        let khz = sr as f64 / 1000.0;
+        let s = if (khz.fract()).abs() < f64::EPSILON {
+            format!("{khz:.0} kHz")
+        } else {
+            format!("{khz:.1} kHz")
+        };
+        parts.push(s);
+    }
+
+    // Channel layout (`"stereo"`, `"5.1"`, …). Use the layout string when set,
+    // otherwise fall back to a channel-count description.
+    if let Some(layout) = audio
+        .and_then(|a| a.channel_layout.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(layout.to_string());
+    } else if let Some(ch) = audio.and_then(|a| a.channels).filter(|c| *c > 0) {
+        parts.push(match ch {
+            1 => "mono".to_string(),
+            2 => "stereo".to_string(),
+            n => format!("{n} ch"),
+        });
+    }
+
+    // Bitrate, in kbps. Prefer the audio stream's bit_rate; fall back to the
+    // source's top-level bitrate.
+    let bit_rate = audio
+        .and_then(|a| a.bit_rate)
+        .or(source.bitrate)
+        .filter(|b| *b > 0);
+    if let Some(br) = bit_rate {
+        parts.push(format!("{} kbps", br / 1000));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
     }
 }
 

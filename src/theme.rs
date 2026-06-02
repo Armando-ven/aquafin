@@ -69,9 +69,14 @@ impl RawComponent {
 // --- Resolved theme ---------------------------------------------------------
 
 /// A fully-resolved theme: each component name maps to a ready-to-use [`Style`].
+/// The palette and the (defaults-merged) raw component map are retained so the
+/// theme can be re-resolved with an overridden palette entry (see
+/// [`Theme::with_accent`]) without re-reading the source TOML.
 #[derive(Debug, Clone)]
 pub struct Theme {
     name: String,
+    palette: BTreeMap<String, Color>,
+    raw_components: BTreeMap<String, RawComponent>,
     components: BTreeMap<String, Style>,
 }
 
@@ -145,13 +150,104 @@ impl Theme {
         palette: &BTreeMap<String, Color>,
         overrides: &BTreeMap<String, RawComponent>,
     ) -> Self {
-        let mut components = BTreeMap::new();
+        let mut raw_components = BTreeMap::new();
         for (key, default) in default_components() {
             let raw = overrides.get(key).cloned().unwrap_or(default);
-            components.insert(key.to_string(), style_from(&raw, palette));
+            raw_components.insert(key.to_string(), raw);
         }
-        Self { name, components }
+        Self::build(name, palette.clone(), raw_components)
     }
+
+    /// Build the final [`Theme`] from an already-merged raw component map.
+    fn build(
+        name: String,
+        palette: BTreeMap<String, Color>,
+        raw_components: BTreeMap<String, RawComponent>,
+    ) -> Self {
+        let components = raw_components
+            .iter()
+            .map(|(k, raw)| (k.clone(), style_from(raw, &palette)))
+            .collect();
+        Self { name, palette, raw_components, components }
+    }
+
+    /// Return a copy of this theme tinted around `color`. The `accent` entry is
+    /// replaced outright; every other "vibrant" palette entry (the secondary
+    /// hues — aqua, peach, lavender, … — plus `selection`) is rotated by the
+    /// same hue delta so the whole UI shifts as a chord rather than just the
+    /// accent-bound components. Neutrals (base/surface/text/border/…) and
+    /// semantic colors (success/warn/error) are left alone so legibility and
+    /// state colors stay stable.
+    pub fn with_accent(&self, color: Color) -> Self {
+        const NEUTRAL: &[&str] = &[
+            "base", "surface", "overlay", "text", "subtext", "border", "accent",
+            "success", "warn", "error",
+        ];
+        let mut palette = self.palette.clone();
+        let original_accent = self.palette.get("accent").copied();
+        palette.insert("accent".to_string(), color);
+        if let (Some(orig), Color::Rgb(nr, ng, nb)) = (original_accent, color) {
+            if let Color::Rgb(or, og, ob) = orig {
+                let (orig_h, _, _) = rgb_to_hsv(or, og, ob);
+                let (new_h, _, _) = rgb_to_hsv(nr, ng, nb);
+                let delta = (new_h - orig_h).rem_euclid(360.0);
+                for (key, value) in palette.iter_mut() {
+                    if NEUTRAL.contains(&key.as_str()) {
+                        continue;
+                    }
+                    *value = rotate_hue(*value, delta);
+                }
+            }
+        }
+        Self::build(self.name.clone(), palette, self.raw_components.clone())
+    }
+}
+
+fn rotate_hue(color: Color, delta_deg: f32) -> Color {
+    let Color::Rgb(r, g, b) = color else { return color };
+    let (h, s, v) = rgb_to_hsv(r, g, b);
+    let (r, g, b) = hsv_to_rgb((h + delta_deg).rem_euclid(360.0), s, v);
+    Color::Rgb(r, g, b)
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == rf {
+        60.0 * (((gf - bf) / delta).rem_euclid(6.0))
+    } else if max == gf {
+        60.0 * ((bf - rf) / delta + 2.0)
+    } else {
+        60.0 * ((rf - gf) / delta + 4.0)
+    };
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    (h, s, max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let h6 = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (h6.rem_euclid(2.0) - 1.0).abs());
+    let (rf, gf, bf) = match h6 as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    (
+        ((rf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((gf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((bf + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// Turn one [`RawComponent`] into a ratatui [`Style`], resolving color tokens
@@ -395,6 +491,25 @@ mod tests {
         .unwrap();
         // focused_border defaults to fg = "accent".
         assert_eq!(theme.focused_border().fg, Some(Color::Rgb(0xab, 0xcd, 0xef)));
+    }
+
+    #[test]
+    fn with_accent_overrides_components_resolving_through_accent() {
+        let theme = parse(
+            "t",
+            r##"
+            [palette]
+            accent = "#010203"
+        "##,
+        )
+        .unwrap();
+        assert_eq!(theme.focused_border().fg, Some(Color::Rgb(1, 2, 3)));
+        let tinted = theme.with_accent(Color::Rgb(0xff, 0, 0xff));
+        assert_eq!(tinted.focused_border().fg, Some(Color::Rgb(0xff, 0, 0xff)));
+        // Original theme is unaffected — `with_accent` returns a new theme.
+        assert_eq!(theme.focused_border().fg, Some(Color::Rgb(1, 2, 3)));
+        // Components that don't reference accent stay put.
+        assert_eq!(tinted.list_item().fg, theme.list_item().fg);
     }
 
     #[test]

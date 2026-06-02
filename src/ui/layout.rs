@@ -7,8 +7,10 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 
-/// Fixed height of the now-playing bar (1 top border + 4 content rows).
-pub const NOW_PLAYING_HEIGHT: u16 = 5;
+/// Fixed height of the now-playing bar — borders + 5 inner rows. The cover
+/// fills the full inner height (almost touching the borders); the text rows
+/// on its right occupy 4 rows with 1 row of breathing space.
+pub const NOW_PLAYING_HEIGHT: u16 = 7;
 /// Top bar: borders + one content row.
 pub const TOP_BAR_HEIGHT: u16 = 3;
 

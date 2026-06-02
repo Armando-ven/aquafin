@@ -205,6 +205,11 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         .as_ref()
         .and_then(|u| u.played)
         .unwrap_or(false);
+    let play_count = dto
+        .user_data
+        .as_ref()
+        .and_then(|u| u.play_count)
+        .unwrap_or(0);
     let (primary_artist_id, primary_artist_name) = dto
         .album_artists
         .iter()
@@ -228,6 +233,8 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         is_favorite,
         is_played,
         normalization_gain_db: dto.normalization_gain,
+        track_number: dto.index_number,
+        play_count,
         album_id: dto.album_id.filter(|s| !s.is_empty()),
         album_name: dto.album.filter(|s| !s.is_empty()),
         primary_artist_id,

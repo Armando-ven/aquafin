@@ -58,6 +58,11 @@ pub struct Item {
     pub is_played: bool,
     /// ReplayGain-style per-track normalization in dB, when the server carries it.
     pub normalization_gain_db: Option<f32>,
+    /// Track number within the parent album (`IndexNumber`). Used for the
+    /// `#` column on music track tables.
+    pub track_number: Option<i32>,
+    /// How many times the user has played this item, per `UserData.PlayCount`.
+    pub play_count: i32,
     /// Parent album id (set on `Audio` tracks). Drives the "Go to album" menu jump.
     pub album_id: Option<String>,
     /// Album display name (paired with `album_id`).
@@ -450,6 +455,12 @@ pub struct NowPlaying {
     pub kind: MediaKind,
     pub title: String,
     pub subtitle: Option<String>,
+    /// Primary artist (audio only).
+    pub artist: Option<String>,
+    /// Parent album name (audio only).
+    pub album: Option<String>,
+    /// Pre-formatted audio format summary, e.g. `"FLAC · 44.1 kHz · stereo · 1466 kbps"`.
+    pub format_summary: Option<String>,
     pub position: Duration,
     pub duration: Option<Duration>,
     pub paused: bool,
@@ -867,8 +878,15 @@ pub struct App {
     pub should_quit: bool,
     /// Display snapshot of current playback; set by the event loop, read by render.
     pub now_playing: Option<NowPlaying>,
-    /// The active color theme.
+    /// The active color theme (with any cover-derived accent override applied).
     pub theme: Theme,
+    /// The user-configured theme, before adaptive-accent tinting. Kept so we
+    /// can rebuild [`Self::theme`] from a fresh accent each time the
+    /// now-playing track (and therefore its cover) changes.
+    base_theme: Theme,
+    /// Tracks which accent override is currently baked into `theme`, so the
+    /// event loop can skip the re-resolve when nothing changed.
+    accent_override: Option<ratatui::style::Color>,
     /// Selectable theme names, for the runtime picker.
     available_themes: Vec<String>,
     /// When the theme picker is open, the highlighted index into `available_themes`.
@@ -995,6 +1013,8 @@ impl App {
             should_quit: false,
             now_playing: None,
             theme: Theme::default(),
+            base_theme: Theme::default(),
+            accent_override: None,
             available_themes: Vec::new(),
             theme_picker: None,
             popup: None,
@@ -1317,16 +1337,18 @@ impl App {
         if rows.is_empty() {
             return;
         }
+        self.home_cursor.row = 0;
         self.home_cursor.col = 0;
     }
 
     fn home_bottom(&mut self) {
         let rows = self.home_rows();
-        if let Some(row) = rows.get(self.home_cursor.row) {
-            if !row.items.is_empty() {
-                self.home_cursor.col = row.items.len() - 1;
-            }
+        if rows.is_empty() {
+            return;
         }
+        self.home_cursor.row = rows.len() - 1;
+        let row_len = rows[self.home_cursor.row].items.len();
+        self.home_cursor.col = row_len.saturating_sub(1);
     }
 
     /// Resolve the focused Home tile. Returns `(row_kind, library_id, item)`.
@@ -1393,12 +1415,33 @@ impl App {
 
     /// Set the active theme (startup, from config, or a runtime switch).
     pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.base_theme = theme.clone();
         self.theme = theme;
+        self.accent_override = None;
         self
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+        self.base_theme = theme.clone();
+        // Re-apply the active cover tint (if any) on top of the new base so
+        // switching themes mid-playback doesn't drop the adaptive accent.
+        self.theme = match self.accent_override {
+            Some(color) => theme.with_accent(color),
+            None => theme,
+        };
+    }
+
+    /// Apply (or clear) a cover-derived accent override. No-op when the choice
+    /// hasn't changed since the last call, so it's cheap to invoke each tick.
+    pub fn apply_cover_accent(&mut self, color: Option<ratatui::style::Color>) {
+        if color == self.accent_override {
+            return;
+        }
+        self.accent_override = color;
+        self.theme = match color {
+            Some(color) => self.base_theme.with_accent(color),
+            None => self.base_theme.clone(),
+        };
     }
 
     /// Provide the selectable theme names (built-ins + user themes).
@@ -3816,6 +3859,14 @@ pub(crate) fn run_browser(
             if let Some(np) = &app.now_playing {
                 im.request(&np.item_id);
             }
+            // Re-tint the UI from the now-playing cover's dominant color (or
+            // clear the tint back to the configured theme when nothing's
+            // playing). Cheap when nothing changed.
+            let accent = app
+                .now_playing
+                .as_ref()
+                .and_then(|np| im.color_for(&np.item_id));
+            app.apply_cover_accent(accent);
         }
 
         // Detail fetches no longer fire on hover — they're driven by the
@@ -4968,7 +5019,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn enter_on_artist_in_music_library_keeps_current_item_on_artist() {
         let mut app = App::with_libraries(vec![Library {
             id: "music".to_string(),
@@ -5173,7 +5223,10 @@ mod tests {
             item_id: "trk1".to_string(),
             kind: MediaKind::Audio,
             title: "Some Song".to_string(),
-            subtitle: Some("Some Artist".to_string()),
+            subtitle: None,
+            artist: Some("Some Artist".to_string()),
+            album: Some("Some Album".to_string()),
+            format_summary: Some("FLAC · 44.1 kHz · stereo · 1466 kbps".to_string()),
             position: Duration::from_secs(30),
             duration: Some(Duration::from_secs(200)),
             paused: false,
@@ -5285,6 +5338,8 @@ mod tests {
                 is_favorite: false,
                 is_played: false,
                 normalization_gain_db: None,
+                track_number: None,
+                play_count: 0,
                 album_id: None,
                 album_name: None,
                 primary_artist_id: None,

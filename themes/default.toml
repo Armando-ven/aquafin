@@ -1,15 +1,55 @@
-# aquafin default theme — an original dark, aqua-accented scheme.
+# aquafin default theme — original aqua-leaning dark scheme with a wider
+# secondary palette so different roles read at a glance (sky-blue folders,
+# peach group headers, gold key hints, mint progress, lavender hints, …).
+# The `accent` entry is what adaptive-cover tinting overrides at runtime.
 name = "default"
 
 [palette]
-base = "#0e1416"
-surface = "#152025"
-overlay = "#23323a"
-text = "#cdd9de"
-subtext = "#7e94a0"
-accent = "#39bdb6"
-success = "#7fd1a0"
-warn = "#e6c478"
-error = "#e2747f"
+base = "#0c1418"
+surface = "#142025"
+overlay = "#1f2e35"
+text = "#d8e4e8"
+subtext = "#8aa0ac"
+accent = "#3ec9c0"
+success = "#6fd49a"
+warn = "#f0c46b"
+error = "#ef7d8b"
 border = "#2a3a42"
-selection = "#1c4f50"
+selection = "#194e54"
+# Secondary palette — distinct hues used by individual components so the UI
+# doesn't read as monochrome. None of these are required keys; they just
+# extend the namespace `[components]` can reference.
+aqua = "#5ee4d0"
+sky = "#6bb9f0"
+lavender = "#b3a5f2"
+rose = "#e98aa9"
+peach = "#f0a472"
+gold = "#e6c478"
+mint = "#88e0a0"
+
+[components]
+header = { fg = "aqua", bold = true }
+list_item = { fg = "text" }
+selected_item = { fg = "base", bg = "accent", bold = true }
+selected_item_blur = { fg = "text", bg = "selection" }
+focused_border = { fg = "accent", bold = true }
+unfocused_border = { fg = "border" }
+status_bar = { fg = "subtext", bg = "surface" }
+hint = { fg = "lavender", bg = "surface" }
+muted = { fg = "subtext" }
+modal = { fg = "text", bg = "surface" }
+modal_border = { fg = "lavender", bold = true }
+search_input = { fg = "text" }
+scrollbar = { fg = "overlay" }
+cheatsheet_group = { fg = "peach", bold = true }
+cheatsheet_key = { fg = "gold", bold = true }
+now_playing_title = { fg = "aqua", bold = true }
+now_playing_subtitle = { fg = "rose" }
+now_playing_meta = { fg = "subtext", dim = true }
+progress_bar = { fg = "mint" }
+progress_track = { fg = "overlay" }
+error_text = { fg = "error", bold = true }
+error_border = { fg = "error", bold = true }
+success_text = { fg = "success", bold = true }
+warn_text = { fg = "warn", bold = true }
+folder_marker = { fg = "sky" }

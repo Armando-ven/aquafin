@@ -35,6 +35,14 @@ pub struct TrackMeta {
     pub item_id: String,
     pub title: String,
     pub subtitle: Option<String>,
+    /// Primary artist (album-artist preferred). Surfaced on the now-playing bar.
+    pub artist: Option<String>,
+    /// Parent album name. Surfaced on the now-playing bar.
+    pub album: Option<String>,
+    /// One-line audio format summary (`"FLAC · 44.1 kHz · stereo · 1466 kbps"`).
+    /// Filled from the server's `MediaSource`/`MediaStream` once the
+    /// playback-info fetch lands; `None` until then.
+    pub format_summary: Option<String>,
     /// ReplayGain-style per-track gain in dB. Applied as a pre-output linear
     /// amplitude scale when audio normalization is enabled.
     pub normalization_gain_db: Option<f32>,
