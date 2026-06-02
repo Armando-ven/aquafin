@@ -3,12 +3,13 @@
 //! clear which entries open.
 
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::theme::Theme;
 use crate::ui::app::Level;
+use crate::ui::panes::item_kind_decor;
 
 pub fn render(
     frame: &mut Frame,
@@ -54,13 +55,8 @@ pub fn render(
         .items
         .iter()
         .map(|item| {
-            let marker = if item.is_favorite { "♥ " } else { "  " };
-            let mut spans = vec![Span::raw(format!("{marker}{}", item.name))];
-            if item.is_folder {
-                // A trailing arrow signals an item you can drill into.
-                spans.push(Span::styled("  ›", theme.folder_marker()));
-            }
-            ListItem::new(Line::from(spans))
+            let decor = item_kind_decor(item, theme);
+            ListItem::new(Line::from(decor.line_spans(item)))
         })
         .collect();
 

@@ -108,6 +108,25 @@ pub struct BaseItemDto {
     /// ReplayGain-style per-track normalization in dB (negative ⇒ attenuate).
     /// Populated by Jellyfin when the source carries a `REPLAYGAIN_TRACK_GAIN` tag.
     pub normalization_gain: Option<f32>,
+    /// Parent album id for an `Audio` track. Drives the "Go to album" jump.
+    pub album_id: Option<String>,
+    /// Album name (display only — the id lives in `album_id`).
+    pub album: Option<String>,
+    /// Album artists with ids; populated on `MusicAlbum` and `Audio` items.
+    /// Drives the "Go to artist" jump.
+    pub album_artists: Vec<NameGuidPair>,
+    /// Track artists with ids (`Audio` / `MusicVideo`). Used as a fallback when
+    /// `album_artists` is empty.
+    pub artist_items: Vec<NameGuidPair>,
+}
+
+/// Jellyfin `NameGuidPair` — a `{Name, Id}` reference returned in fields like
+/// `AlbumArtists` and `ArtistItems`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct NameGuidPair {
+    pub name: Option<String>,
+    pub id: Option<String>,
 }
 
 /// One chapter marker on an item (a name + a timestamp into the file).

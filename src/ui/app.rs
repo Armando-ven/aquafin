@@ -58,6 +58,14 @@ pub struct Item {
     pub is_played: bool,
     /// ReplayGain-style per-track normalization in dB, when the server carries it.
     pub normalization_gain_db: Option<f32>,
+    /// Parent album id (set on `Audio` tracks). Drives the "Go to album" menu jump.
+    pub album_id: Option<String>,
+    /// Album display name (paired with `album_id`).
+    pub album_name: Option<String>,
+    /// Primary artist reference for the "Go to artist" menu jump. Prefers the
+    /// album-artist on tracks/albums and falls back to the first track artist.
+    pub primary_artist_id: Option<String>,
+    pub primary_artist_name: Option<String>,
 }
 
 /// How an item plays back: video opens in mpv, audio plays in-app, everything
@@ -194,8 +202,15 @@ pub enum Intent {
         extras: SectionFilters,
     },
     /// Run a search query (Enter inside the search input). Results replace the
-    /// active library's root level via `apply_search_results`.
-    Search { query: String },
+    /// active library's root level via `apply_search_results`. `item_types`
+    /// scopes the search to the active section's Jellyfin item types (empty =
+    /// search every type, i.e. section "All"). `scope_label` is the section
+    /// name surfaced in the level title (empty for "All").
+    Search {
+        query: String,
+        item_types: Vec<String>,
+        scope_label: String,
+    },
     /// User-requested queue navigation (`n` / `p`).
     QueueNext,
     QueuePrev,
@@ -277,6 +292,10 @@ pub enum ItemMenuAction {
     OpenSleepTimerPicker,
     BrowseByGenre,
     BrowseByPerson,
+    /// Drill into the parent album of the focused track.
+    GoToAlbum,
+    /// Drill into the primary artist of the focused track or album.
+    GoToArtist,
     PlayNext,
     AddToQueue,
     SaveQueueAsPlaylist,
@@ -2072,8 +2091,10 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Up => self.cursor_up(),
             Action::Down => self.cursor_down(),
-            Action::Left => self.focus_prev_or_back(),
-            Action::Right => self.focus_next(),
+            Action::Left => self.go_back(),
+            Action::Right => self.activate(),
+            Action::FocusNext => self.focus_next(),
+            Action::FocusPrev => self.focus_prev(),
             Action::Top => self.go_top(),
             Action::Bottom => self.go_bottom(),
             Action::Play => self.activate(),
@@ -2220,13 +2241,24 @@ impl App {
             .push(Intent::SaveSearchHistory(self.search_history.clone()));
     }
 
-    /// Push a loading root level and queue the search fetch.
+    /// Push a loading root level and queue the search fetch. The active
+    /// section narrows the search to its item types — section "All" (empty
+    /// `item_types`) searches every type in the library.
     fn start_search(&mut self, query: String) {
         let Some(library) = self.current_library().cloned() else {
             return;
         };
+        let section = self.current_section();
+        let item_types = section
+            .as_ref()
+            .map(|s| s.item_types.clone())
+            .unwrap_or_default();
+        let scope_label = match section.as_ref() {
+            Some(s) if !s.item_types.is_empty() => s.name.clone(),
+            _ => String::new(),
+        };
         self.stack = vec![Level {
-            title: format!("Search: {query}"),
+            title: search_level_title(&scope_label, &query),
             parent_id: library.id.clone(),
             items: Vec::new(),
             selected: 0,
@@ -2234,7 +2266,11 @@ impl App {
             parent_item: None,
             cursor_engaged: true,
         }];
-        self.pending.push(Intent::Search { query });
+        self.pending.push(Intent::Search {
+            query,
+            item_types,
+            scope_label,
+        });
     }
 
     /// Popup state for the renderer: which menu is open and which entry is highlighted.
@@ -2349,6 +2385,12 @@ impl App {
                     ItemMenuAction::BrowseByPerson,
                 ));
             }
+        }
+        if let Some(label) = go_to_artist_label(item) {
+            entries.push((label, ItemMenuAction::GoToArtist));
+        }
+        if let Some(label) = go_to_album_label(item) {
+            entries.push((label, ItemMenuAction::GoToAlbum));
         }
         entries.push(("Add to playlist…".to_string(), ItemMenuAction::AddToPlaylist));
         if is_audio {
@@ -2573,6 +2615,8 @@ impl App {
             ItemMenuAction::TogglePlayed => self.toggle_played(),
             ItemMenuAction::BrowseByGenre => self.browse_by_first_genre(),
             ItemMenuAction::BrowseByPerson => self.browse_by_first_person(),
+            ItemMenuAction::GoToAlbum => self.go_to_album(),
+            ItemMenuAction::GoToArtist => self.go_to_artist(),
             ItemMenuAction::PlayNext => self.play_next_or_append(true),
             ItemMenuAction::AddToQueue => self.play_next_or_append(false),
             ItemMenuAction::GenreRadio => self.start_genre_radio(),
@@ -2769,6 +2813,52 @@ impl App {
 
     /// Use the first genre from `current_detail` as a filter on the active
     /// library, then re-apply the "All" section.
+    /// Drill into the focused item's parent album (track → album view).
+    fn go_to_album(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        let (Some(album_id), Some(album_name)) = (
+            item.album_id.clone(),
+            item.album_name.clone().or_else(|| Some("Album".to_string())),
+        ) else {
+            self.set_status("No album on this item.");
+            return;
+        };
+        let album = Item {
+            id: album_id,
+            name: album_name,
+            kind: Some("MusicAlbum".to_string()),
+            is_folder: true,
+            ..Item::default()
+        };
+        self.drill_into(&album);
+    }
+
+    /// Drill into the focused item's primary artist (track/album → artist view).
+    fn go_to_artist(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        let Some(artist_id) = item.primary_artist_id.clone() else {
+            self.set_status("No artist on this item.");
+            return;
+        };
+        let artist_name = item
+            .primary_artist_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Artist".to_string());
+        let artist = Item {
+            id: artist_id,
+            name: artist_name,
+            kind: Some("MusicArtist".to_string()),
+            is_folder: true,
+            ..Item::default()
+        };
+        self.drill_into(&artist);
+    }
+
     fn browse_by_first_genre(&mut self) {
         let Some(library) = self.current_library().cloned() else {
             return;
@@ -3091,6 +3181,19 @@ impl App {
                 .first()
                 .and_then(|l| l.items.get(l.selected))
                 .cloned()
+        } else if self.focus == Pane::Content && self.is_drilled() {
+            // Activating the drilled middle pane must hit the *child* the
+            // cursor sits on, not the parent. `current_item()` pins to
+            // `parent_item` while `cursor_engaged` is false (so the info pane
+            // doesn't flicker), so without engaging here Right/Enter would
+            // re-drill into the same parent forever.
+            if let Some(level) = self.stack.last_mut() {
+                level.cursor_engaged = true;
+            }
+            self.stack
+                .last()
+                .and_then(|l| l.items.get(l.selected))
+                .cloned()
         } else {
             self.current_item().cloned()
         };
@@ -3332,13 +3435,8 @@ impl App {
     /// move focus to the middle pane where the children will render. Also
     /// reveals the item so the right-top info pane auto-fetches.
     ///
-    /// Focus shift behaviour:
-    /// - Music libraries shift focus to the Content pane (the drilled-in
-    ///   album/playlist track list is what the user wants next).
-    /// - Every other library type keeps focus on the items pane so the info
-    ///   pane on the right keeps rendering the entered series/album/etc.
-    ///   instead of jumping to a child item's info. The user can press `g c`
-    ///   or `Right` to move into the children when they're ready.
+    /// Focus always shifts to the Content pane so Up/Down + Right walk the
+    /// just-opened folder's children without a second keystroke.
     fn drill_into(&mut self, item: &Item) {
         self.stack.push(Level {
             title: item.name.clone(),
@@ -3349,12 +3447,7 @@ impl App {
             parent_item: Some(item.clone()),
             cursor_engaged: false,
         });
-        let collection = self
-            .current_library()
-            .and_then(|l| l.collection_type.clone());
-        if collection.as_deref() == Some("music") {
-            self.focus = Pane::Content;
-        }
+        self.focus = Pane::Content;
         self.reveal_item(item.id.clone());
         self.set_context_view(ContextTopView::Info);
         self.pending.push(Intent::LoadCurrentDetail {
@@ -3512,39 +3605,76 @@ impl App {
         }
     }
 
-    /// Cycle focus forward (Right). Order:
-    /// LibraryItems → LibrarySections → Content → ContextTop → ContextBottom.
+    /// Panes participating in Tab / Shift+Tab cycling, in left-to-right order.
+    /// Context panes are filtered out when they would render an empty
+    /// placeholder, so Tab never lands on a dead pane. Home and GlobalSearch
+    /// are full-screen views and intentionally not part of the cycle.
+    fn pane_cycle(&self) -> Vec<Pane> {
+        let mut cycle = vec![
+            Pane::TopBar,
+            Pane::LibraryItems,
+            Pane::LibrarySections,
+            Pane::Content,
+        ];
+        if self.is_context_top_active() {
+            cycle.push(Pane::ContextTop);
+        }
+        if self.is_context_bottom_active() {
+            cycle.push(Pane::ContextBottom);
+        }
+        cycle
+    }
+
+    /// True when the top context pane has real content to show — used by
+    /// `pane_cycle` so Tab skips empty placeholders.
+    fn is_context_top_active(&self) -> bool {
+        let collection = self
+            .current_library()
+            .and_then(|l| l.collection_type.as_deref());
+        match collection {
+            Some("music") => true,
+            Some("movies") | Some("tvshows") => self.current_item_revealed(),
+            _ => false,
+        }
+    }
+
+    /// True when the bottom context pane has real content to show.
+    fn is_context_bottom_active(&self) -> bool {
+        let collection = self
+            .current_library()
+            .and_then(|l| l.collection_type.as_deref());
+        match collection {
+            Some("music") => !self.queue.is_empty(),
+            Some("movies") | Some("tvshows") => self.current_item_revealed(),
+            _ => false,
+        }
+    }
+
+    /// Cycle focus to the next pane (Tab). Wraps around to the first pane.
     fn focus_next(&mut self) {
-        self.focus = match self.focus {
-            Pane::TopBar | Pane::LibraryItems => Pane::LibrarySections,
-            Pane::LibrarySections => Pane::Content,
-            Pane::Content => Pane::ContextTop,
-            Pane::ContextTop => Pane::ContextBottom,
-            Pane::ContextBottom => Pane::ContextBottom,
-            Pane::Home => Pane::Home,
-            Pane::GlobalSearch => Pane::GlobalSearch,
+        let cycle = self.pane_cycle();
+        let i = cycle
+            .iter()
+            .position(|p| *p == self.focus)
+            .unwrap_or(usize::MAX);
+        self.focus = if i == usize::MAX {
+            cycle[0]
+        } else {
+            cycle[(i + 1) % cycle.len()]
         };
     }
 
-    /// Cycle focus back (Left). When focused on the middle pane while drilled
-    /// (yazi-style), Left first walks up the folder stack; popping the last
-    /// drilled level then restores focus to the left items pane.
-    fn focus_prev_or_back(&mut self) {
-        if self.focus == Pane::Content && self.is_drilled() {
-            self.stack.pop();
-            if !self.is_drilled() {
-                self.focus = Pane::LibraryItems;
-            }
-            return;
-        }
-        self.focus = match self.focus {
-            Pane::ContextBottom => Pane::ContextTop,
-            Pane::ContextTop => Pane::Content,
-            Pane::Content => Pane::LibrarySections,
-            Pane::LibrarySections => Pane::LibraryItems,
-            Pane::LibraryItems | Pane::TopBar => Pane::LibraryItems,
-            Pane::Home => Pane::Home,
-            Pane::GlobalSearch => Pane::GlobalSearch,
+    /// Cycle focus to the previous pane (Shift+Tab). Wraps around to the last pane.
+    fn focus_prev(&mut self) {
+        let cycle = self.pane_cycle();
+        let i = cycle
+            .iter()
+            .position(|p| *p == self.focus)
+            .unwrap_or(usize::MAX);
+        self.focus = if i == usize::MAX {
+            cycle[cycle.len() - 1]
+        } else {
+            cycle[(i + cycle.len() - 1) % cycle.len()]
         };
     }
 
@@ -3730,14 +3860,18 @@ pub(crate) fn run_browser(
                         br.apply_section(library_id, library_name, section, extras);
                     }
                 }
-                Intent::Search { query } => {
+                Intent::Search {
+                    query,
+                    item_types,
+                    scope_label,
+                } => {
                     let library_id = app
                         .current_library()
                         .map(|l| l.id.clone())
                         .unwrap_or_default();
                     if !library_id.is_empty() {
                         if let Some(br) = browser.as_deref_mut() {
-                            br.search(library_id, query);
+                            br.search(library_id, query, item_types, scope_label);
                         }
                     }
                 }
@@ -3968,6 +4102,52 @@ fn persist_last_library(id: String) -> Result<()> {
     let mut config = crate::config::Config::load()?.unwrap_or_default();
     config.ui.last_library_id = Some(id);
     config.save()
+}
+
+/// Menu label for the "Go to artist" action — `None` when the item has no
+/// known primary artist id. Shown on tracks and albums (`MusicAlbum`); a
+/// `MusicArtist` is itself the artist, so the action is hidden.
+fn go_to_artist_label(item: &Item) -> Option<String> {
+    if item.kind.as_deref() == Some("MusicArtist") {
+        return None;
+    }
+    let id = item.primary_artist_id.as_deref()?;
+    if id.is_empty() {
+        return None;
+    }
+    let name = item
+        .primary_artist_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("artist");
+    Some(format!("Go to artist: {name}"))
+}
+
+/// Menu label for the "Go to album" action — `None` unless the item has a
+/// parent album id (i.e. an `Audio` track).
+fn go_to_album_label(item: &Item) -> Option<String> {
+    let id = item.album_id.as_deref()?;
+    if id.is_empty() {
+        return None;
+    }
+    let name = item
+        .album_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("album");
+    Some(format!("Go to album: {name}"))
+}
+
+/// Format the level title for an in-flight or completed search. The scope
+/// label (current section name, e.g. "Albums") is included when non-empty so
+/// the user can see the search is narrowed; section "All" yields the bare
+/// "Search: …" form.
+pub(super) fn search_level_title(scope_label: &str, query: &str) -> String {
+    if scope_label.is_empty() {
+        format!("Search: {query}")
+    } else {
+        format!("Search · {scope_label}: {query}")
+    }
 }
 
 fn persist_search_history(history: Vec<String>) -> Result<()> {
@@ -4483,31 +4663,38 @@ mod tests {
     }
 
     #[test]
-    fn focus_cycles_through_panes() {
-        // App starts focused on LibraryItems; Right walks through sections,
-        // content, and the two context panes; Left walks back.
+    fn tab_cycles_focus_with_wrap_around() {
+        // Tab walks forward across active panes; Shift+Tab walks back. Both
+        // wrap. Inactive context panes (no revealed item, empty queue) are
+        // skipped so Tab never lands on a dead placeholder.
         let mut app = App::new();
         assert_eq!(app.focus, Pane::LibraryItems);
-        app.handle_key(press(KeyCode::Right));
+        app.handle_key(press(KeyCode::Tab));
         assert_eq!(app.focus, Pane::LibrarySections);
-        app.handle_key(press(KeyCode::Right));
+        app.handle_key(press(KeyCode::Tab));
         assert_eq!(app.focus, Pane::Content);
-        app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.focus, Pane::ContextTop);
-        app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.focus, Pane::ContextBottom);
-        app.handle_key(press(KeyCode::Right)); // clamps at the rightmost pane
-        assert_eq!(app.focus, Pane::ContextBottom);
-        app.handle_key(press(KeyCode::Left));
-        assert_eq!(app.focus, Pane::ContextTop);
-        app.handle_key(press(KeyCode::Left));
+        // Context panes are inactive without a revealed item / queued track,
+        // so Tab wraps back to the TopBar.
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.focus, Pane::TopBar);
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.focus, Pane::LibraryItems);
+        // Shift+Tab wraps the other direction.
+        app.handle_key(press(KeyCode::BackTab));
+        assert_eq!(app.focus, Pane::TopBar);
+        app.handle_key(press(KeyCode::BackTab));
         assert_eq!(app.focus, Pane::Content);
-        app.handle_key(press(KeyCode::Left));
-        assert_eq!(app.focus, Pane::LibrarySections);
-        app.handle_key(press(KeyCode::Left));
+    }
+
+    #[test]
+    fn left_right_arrows_act_as_back_and_activate() {
+        // Right activates (like Enter); Left goes back (like Backspace).
+        // Pane cycling is reserved for Tab / Shift+Tab.
+        let mut app = App::new();
         assert_eq!(app.focus, Pane::LibraryItems);
-        app.handle_key(press(KeyCode::Left)); // clamps at the leftmost pane
-        assert_eq!(app.focus, Pane::LibraryItems);
+        // From a non-drilled library root, Left walks up to the top bar.
+        app.handle_key(press(KeyCode::Left));
+        assert_eq!(app.focus, Pane::TopBar);
     }
 
     #[test]
@@ -4582,7 +4769,6 @@ mod tests {
     #[test]
     fn f_toggles_favorite_optimistically_and_emits_intent() {
         let mut app = app_with_item("Movie");
-        app.handle_key(press(KeyCode::Right)); // focus list
         app.handle_key(press(KeyCode::Char('f')));
         assert!(app.current_item().unwrap().is_favorite);
         assert_eq!(
@@ -4843,7 +5029,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_series_keeps_focus_and_current_item_on_series() {
+    fn enter_on_series_drills_and_shifts_focus_to_content() {
         let mut app = App::with_libraries(vec![Library {
             id: "tv".to_string(),
             name: "TV".to_string(),
@@ -4852,24 +5038,23 @@ mod tests {
         }]);
         app.handle_key(press(KeyCode::Enter));
         assert!(app.is_drilled());
-        assert_eq!(app.focus, Pane::LibraryItems);
-        // current_item still points at the Series (root level), so the info
-        // pane keeps rendering Severance instead of a (loading) child level.
+        assert_eq!(app.focus, Pane::Content);
+        // Until the cursor engages in the drilled level, current_item stays on
+        // the parent so the info pane keeps rendering Severance instead of a
+        // blank child slot.
         assert_eq!(app.current_item().map(|i| i.name.as_str()), Some("Severance"));
-        // Auto-revealed by drill_into so the info pane actually draws.
         assert!(app.current_item_revealed());
     }
 
     #[test]
-    fn left_in_drilled_list_goes_up_a_level() {
-        // Initial focus is LibraryItems; Enter on a Series in a non-music
-        // library now keeps focus on the items list so the info pane stays on
-        // the entered show. Backspace pops the drilled level.
+    fn back_in_drilled_list_goes_up_a_level() {
+        // Enter drills into the Series and moves focus to Content; Backspace
+        // pops the drilled level and returns focus to the items pane.
         let mut app = app_with_item("Series");
-        app.handle_key(press(KeyCode::Enter)); // drill in
+        app.handle_key(press(KeyCode::Enter));
         let _ = app.take_intents();
         assert!(app.is_drilled());
-        assert_eq!(app.focus, Pane::LibraryItems);
+        assert_eq!(app.focus, Pane::Content);
         app.handle_key(press(KeyCode::Backspace));
         assert!(!app.is_drilled());
         assert_eq!(app.focus, Pane::LibraryItems);
@@ -5100,6 +5285,10 @@ mod tests {
                 is_favorite: false,
                 is_played: false,
                 normalization_gain_db: None,
+                album_id: None,
+                album_name: None,
+                primary_artist_id: None,
+                primary_artist_name: None,
             }],
         }]);
         let out = rendered(&app, 120, 30);
@@ -5241,6 +5430,148 @@ mod tests {
     }
 
     #[test]
+    fn go_to_album_drills_into_parent_album() {
+        let track = Item {
+            id: "track-1".to_string(),
+            name: "Get Lucky".to_string(),
+            kind: Some("Audio".to_string()),
+            album_id: Some("album-1".to_string()),
+            album_name: Some("Random Access Memories".to_string()),
+            ..Item::default()
+        };
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![track],
+        }]);
+        let entries = app.item_menu_entries();
+        assert!(entries.iter().any(|(label, action)| {
+            label == "Go to album: Random Access Memories"
+                && *action == ItemMenuAction::GoToAlbum
+        }));
+        app.go_to_album();
+        let level = app.current_level().unwrap();
+        assert_eq!(level.parent_id, "album-1");
+        assert_eq!(level.title, "Random Access Memories");
+    }
+
+    #[test]
+    fn go_to_artist_drills_into_primary_artist() {
+        let track = Item {
+            id: "track-1".to_string(),
+            name: "Get Lucky".to_string(),
+            kind: Some("Audio".to_string()),
+            primary_artist_id: Some("artist-1".to_string()),
+            primary_artist_name: Some("Daft Punk".to_string()),
+            ..Item::default()
+        };
+        let mut app = App::with_libraries(vec![Library {
+            id: "music".to_string(),
+            name: "Music".to_string(),
+            collection_type: Some("music".to_string()),
+            items: vec![track],
+        }]);
+        let entries = app.item_menu_entries();
+        assert!(entries.iter().any(|(label, action)| {
+            label == "Go to artist: Daft Punk" && *action == ItemMenuAction::GoToArtist
+        }));
+        app.go_to_artist();
+        let level = app.current_level().unwrap();
+        assert_eq!(level.parent_id, "artist-1");
+        assert_eq!(level.title, "Daft Punk");
+    }
+
+    #[test]
+    fn go_to_actions_hidden_when_no_artist_or_album() {
+        let movie = Item {
+            id: "1".to_string(),
+            name: "The Matrix".to_string(),
+            kind: Some("Movie".to_string()),
+            ..Item::default()
+        };
+        let app = App::with_libraries(vec![Library {
+            id: "movies".to_string(),
+            name: "Movies".to_string(),
+            collection_type: Some("movies".to_string()),
+            items: vec![movie],
+        }]);
+        let entries = app.item_menu_entries();
+        assert!(!entries
+            .iter()
+            .any(|(_, a)| matches!(a, ItemMenuAction::GoToAlbum | ItemMenuAction::GoToArtist)));
+    }
+
+    #[test]
+    fn search_scopes_to_current_section_item_types() {
+        let mut app = App::new();
+        // Switch to the music library and pick the "Albums" section so any
+        // subsequent search is scoped to MusicAlbum.
+        app.handle_key(press(KeyCode::Char('3')));
+        app.focus = Pane::LibrarySections;
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        let _ = app.take_intents();
+        app.focus = Pane::LibraryItems;
+
+        app.handle_key(press(KeyCode::Char('/')));
+        for c in "discovery".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+
+        let intents = app.take_intents();
+        let search = intents
+            .iter()
+            .find_map(|i| match i {
+                Intent::Search {
+                    query,
+                    item_types,
+                    scope_label,
+                } => Some((query.clone(), item_types.clone(), scope_label.clone())),
+                _ => None,
+            })
+            .expect("expected a Search intent");
+        assert_eq!(search.0, "discovery");
+        assert_eq!(search.1, vec!["MusicAlbum".to_string()]);
+        assert_eq!(search.2, "Albums");
+        assert_eq!(
+            app.current_level().unwrap().title,
+            "Search · Albums: discovery"
+        );
+    }
+
+    #[test]
+    fn search_on_section_all_has_no_item_types() {
+        let mut app = App::new();
+        // Music library, default section is "All" (item_types empty).
+        app.handle_key(press(KeyCode::Char('3')));
+        let _ = app.take_intents();
+
+        app.handle_key(press(KeyCode::Char('/')));
+        for c in "x".chars() {
+            app.handle_key(press(KeyCode::Char(c)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+
+        let intents = app.take_intents();
+        let search = intents
+            .iter()
+            .find_map(|i| match i {
+                Intent::Search {
+                    item_types,
+                    scope_label,
+                    ..
+                } => Some((item_types.clone(), scope_label.clone())),
+                _ => None,
+            })
+            .expect("expected a Search intent");
+        assert!(search.0.is_empty());
+        assert!(search.1.is_empty());
+        assert_eq!(app.current_level().unwrap().title, "Search: x");
+    }
+
+    #[test]
     fn slash_opens_search_input_and_chars_build_the_query() {
         let mut app = App::new();
         app.handle_key(press(KeyCode::Char('/')));
@@ -5285,7 +5616,17 @@ mod tests {
             other => panic!("expected SaveSearchHistory, got {other:?}"),
         }
         match &intents[1] {
-            Intent::Search { query } => assert_eq!(query, "matrix"),
+            Intent::Search {
+                query,
+                item_types,
+                scope_label,
+            } => {
+                assert_eq!(query, "matrix");
+                // Default library has no collection type → only section
+                // available is "All" with empty item_types.
+                assert!(item_types.is_empty());
+                assert!(scope_label.is_empty());
+            }
             other => panic!("expected Search, got {other:?}"),
         }
         assert!(app.current_level().unwrap().loading);

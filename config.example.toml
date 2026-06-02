@@ -25,14 +25,17 @@ image_protocol = "auto"
 # Defaults are arrow-key navigation; uncomment/edit to customize.
 #
 # Recognized keys: up, down, left, right, home, end, pageup, pagedown, enter,
-#   esc, space, tab, backspace, delete, insert, f1..f12, any single character
-#   (e.g. "q", "/"), with optional "ctrl+" / "alt+" modifiers (e.g. "ctrl+d").
+#   esc, space, tab, backtab, backspace, delete, insert, f1..f12, any single
+#   character (e.g. "q", "/"), with optional "ctrl+" / "alt+" modifiers
+#   (e.g. "ctrl+d").
 #
 # Actions and their defaults:
 #   up            = "up"        # move selection up
 #   down          = "down"      # move selection down
-#   left          = "left"      # focus previous pane
-#   right         = "right"     # focus next pane
+#   left          = "left"      # go back (same as backspace): pop a drilled folder, or drop focus to the top bar
+#   right         = "right"     # activate (same as enter): open a folder / play the focused item
+#   focus_next    = "tab"       # focus next pane (wraps; skips empty context panes)
+#   focus_prev    = "backtab"   # focus previous pane (Shift+Tab)
 #   top           = "home"      # jump to top
 #   bottom        = "end"       # jump to bottom
 #   back          = "backspace" # go up a folder level (left arrow also works in a drilled list)

@@ -205,6 +205,17 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         .as_ref()
         .and_then(|u| u.played)
         .unwrap_or(false);
+    let (primary_artist_id, primary_artist_name) = dto
+        .album_artists
+        .iter()
+        .chain(dto.artist_items.iter())
+        .find_map(|p| {
+            let id = p.id.clone().filter(|s| !s.is_empty())?;
+            let name = p.name.clone().unwrap_or_default();
+            Some((id, name))
+        })
+        .map(|(id, name)| (Some(id), Some(name)))
+        .unwrap_or((None, None));
     app::Item {
         is_folder: dto.is_folder.unwrap_or(false),
         id: dto.id,
@@ -217,6 +228,10 @@ pub(crate) fn item_from_dto(dto: api::models::BaseItemDto) -> app::Item {
         is_favorite,
         is_played,
         normalization_gain_db: dto.normalization_gain,
+        album_id: dto.album_id.filter(|s| !s.is_empty()),
+        album_name: dto.album.filter(|s| !s.is_empty()),
+        primary_artist_id,
+        primary_artist_name,
     }
 }
 

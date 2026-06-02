@@ -13,6 +13,10 @@ pub enum Action {
     Down,
     Left,
     Right,
+    /// Cycle focus to the next pane (wraps; skips inactive context panes).
+    FocusNext,
+    /// Cycle focus to the previous pane (wraps; skips inactive context panes).
+    FocusPrev,
     Top,
     Bottom,
     /// Go up a folder level (or to the sidebar at a library root).
@@ -69,8 +73,10 @@ struct ActionSpec {
 const ACTIONS: &[ActionSpec] = &[
     ActionSpec { action: Action::Up, name: "up", default_keys: "up", desc: "Move up", group: "Navigation" },
     ActionSpec { action: Action::Down, name: "down", default_keys: "down", desc: "Move down", group: "Navigation" },
-    ActionSpec { action: Action::Left, name: "left", default_keys: "left", desc: "Focus previous pane", group: "Navigation" },
-    ActionSpec { action: Action::Right, name: "right", default_keys: "right", desc: "Focus next pane", group: "Navigation" },
+    ActionSpec { action: Action::Left, name: "left", default_keys: "left", desc: "Move left (content / option)", group: "Navigation" },
+    ActionSpec { action: Action::Right, name: "right", default_keys: "right", desc: "Move right (content / option)", group: "Navigation" },
+    ActionSpec { action: Action::FocusNext, name: "focus_next", default_keys: "tab", desc: "Focus next pane", group: "Navigation" },
+    ActionSpec { action: Action::FocusPrev, name: "focus_prev", default_keys: "backtab", desc: "Focus previous pane", group: "Navigation" },
     ActionSpec { action: Action::Top, name: "top", default_keys: "home", desc: "Jump to top", group: "Navigation" },
     ActionSpec { action: Action::Bottom, name: "bottom", default_keys: "end", desc: "Jump to bottom", group: "Navigation" },
     ActionSpec { action: Action::Back, name: "back", default_keys: "backspace", desc: "Back / up a folder", group: "Navigation" },
@@ -219,7 +225,9 @@ pub struct DescribedGroup {
 /// SHIFT is dropped for character keys (the character already encodes case), so
 /// `"G"` in config matches the `Char('G')` + SHIFT event crossterm reports.
 fn normalize(code: KeyCode, mods: KeyModifiers) -> KeyChord {
-    let mods = if matches!(code, KeyCode::Char(_)) {
+    // SHIFT is encoded in the char itself, and crossterm reports BackTab with
+    // SHIFT held — neither benefits from carrying SHIFT in the chord.
+    let mods = if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
         mods & !KeyModifiers::SHIFT
     } else {
         mods
@@ -264,6 +272,7 @@ fn parse_keycode(name: &str) -> Option<KeyCode> {
         "esc" | "escape" => KeyCode::Esc,
         "space" => KeyCode::Char(' '),
         "tab" => KeyCode::Tab,
+        "backtab" | "shift+tab" => KeyCode::BackTab,
         "backspace" | "bksp" => KeyCode::Backspace,
         "delete" | "del" => KeyCode::Delete,
         "insert" | "ins" => KeyCode::Insert,
@@ -308,6 +317,7 @@ fn keycode_display(code: KeyCode) -> String {
         KeyCode::Enter => "Enter".to_string(),
         KeyCode::Esc => "Esc".to_string(),
         KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "Shift+Tab".to_string(),
         KeyCode::Backspace => "Bksp".to_string(),
         KeyCode::Char(' ') => "Space".to_string(),
         KeyCode::Char(c) => c.to_string(),

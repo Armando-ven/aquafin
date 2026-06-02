@@ -32,6 +32,9 @@ enum BrowseResult {
     Search {
         library_id: String,
         query: String,
+        /// Section name the search was scoped to (e.g. "Albums"). Empty for an
+        /// unscoped (section "All") search.
+        scope_label: String,
         items: Vec<Item>,
     },
     /// Server-wide search results — fed into the global-search view.
@@ -146,8 +149,16 @@ impl Browser {
 
     /// Library-scoped search: runs an `Items` query with `parentId` +
     /// `searchTerm` (recursive) so results stay within the current library.
+    /// `item_types` further narrows the search to the active section's
+    /// Jellyfin types (empty = section "All", every type included).
     /// Results replace the active library's root level.
-    pub fn search(&mut self, library_id: String, query: String) {
+    pub fn search(
+        &mut self,
+        library_id: String,
+        query: String,
+        item_types: Vec<String>,
+        scope_label: String,
+    ) {
         let client = self.client.clone();
         let tx = self.tx.clone();
         self.rt.spawn(async move {
@@ -155,6 +166,7 @@ impl Browser {
                 parent_id: Some(library_id.clone()),
                 search_term: Some(query.clone()),
                 recursive: Some(true),
+                include_item_types: item_types,
                 sort_by: vec!["SortName".to_string()],
                 fields: vec!["Overview".to_string()],
                 limit: Some(200),
@@ -166,6 +178,7 @@ impl Browser {
                     BrowseResult::Search {
                         library_id,
                         query,
+                        scope_label,
                         items,
                     }
                 }
@@ -540,8 +553,13 @@ impl Browser {
                 BrowseResult::Search {
                     library_id,
                     query,
+                    scope_label,
                     items,
-                } => app.apply_root_items(&library_id, format!("Search: {query}"), items),
+                } => app.apply_root_items(
+                    &library_id,
+                    super::app::search_level_title(&scope_label, &query),
+                    items,
+                ),
                 BrowseResult::Failed { id, message } => {
                     app.drop_loading_level(&id);
                     app.show_error(message);

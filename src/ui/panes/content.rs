@@ -12,6 +12,7 @@ use crate::theme::Theme;
 use crate::ui::app::{
     options_cursor_positions, Level, MediaOptionsCursor, MediaOptionsViewState,
 };
+use crate::ui::panes::item_kind_decor;
 
 pub fn render(
     frame: &mut Frame,
@@ -64,12 +65,8 @@ fn render_drilled(frame: &mut Frame, area: Rect, level: &Level, focused: bool, t
         .items
         .iter()
         .map(|item| {
-            let marker = if item.is_favorite { "♥ " } else { "  " };
-            let mut spans = vec![Span::raw(format!("{marker}{}", item.name))];
-            if item.is_folder {
-                spans.push(Span::styled("  ›", theme.folder_marker()));
-            }
-            ListItem::new(Line::from(spans))
+            let decor = item_kind_decor(item, theme);
+            ListItem::new(Line::from(decor.line_spans(item)))
         })
         .collect();
 
